@@ -1,0 +1,52 @@
+artifacts_root: artifacts
+
+# Data Ingestion Configuration
+data_ingestion:
+  root_dir: artifacts/data_ingestion
+  raw_data_dir: artifacts/data_ingestion/raw
+  processed_data_dir: artifacts/data_ingestion/processed
+  
+  # OpenF1 API Configuration
+  api:
+    base_url: https://api.openf1.org/v1
+    timeout: 30
+    max_retries: 3
+    batch_size: 1000
+  
+  # Target all 2025 race weekends
+  target_meetings:
+    - meeting_key: "latest"
+    - meeting_key: "1253"  # Pre-Season Testing
+    - meeting_key: "1254"  # Australian Grand Prix
+    - meeting_key: "1255"  # Chinese Grand Prix
+    - meeting_key: "1256"  # Japanese Grand Prix
+    - meeting_key: "1257"  # Bahrain Grand Prix
+    - meeting_key: "1258"  # Saudi Arabian Grand Prix
+    - meeting_key: "1259"  # Miami Grand Prix
+    - meeting_key: "1260"  # Emilia Romagna Grand Prix
+    - meeting_key: "1261"  # Monaco Grand Prix
+    - meeting_key: "1262"  # Spanish Grand Prix
+    - meeting_key: "1263"  # Canadian Grand Prix
+    - meeting_key: "1264"  # Austrian Grand Prix
+  
+  # Sessions to ingest for each meeting
+  sessions_to_ingest:
+    - "Practice 1"
+    - "Practice 2" 
+    - "Practice 3"
+    - "Qualifying"
+    - "Sprint"
+    - "Race"
+  
+  # Endpoints to ingest
+  endpoints:
+    - "meetings"
+    - "sessions"
+    - "drivers"
+    - "laps"
+    - "pit"
+    - "stints"
+    - "position"
+    - "intervals"
+    - "weather"
+    - "race_control"
