@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 from src.formula_one.logging import logger
 from src.formula_one.entity.config_entity import DataIngestionConfig, DatabaseConfig
+from src.formula_one.utils.database_utils import DatabaseUtils
 
 class OpenF1APIClient:
     def __init__(self, config: DataIngestionConfig):
@@ -105,24 +106,13 @@ class DatabaseIngestion:
     def __init__(self, data_config: DataIngestionConfig, db_config: DatabaseConfig, api_client: OpenF1APIClient):
         self.data_config = data_config
         self.db_config = db_config
-        self.api_client = api_client  # Add this line
-        self.logger = logger 
+        self.api_client = api_client
+        self.db_utils = DatabaseUtils(db_config)
+        self.logger = logger
     
     def connect_to_db(self):
         """Create database connection"""
-        try:
-            conn = psycopg2.connect(
-                host=self.db_config.host,
-                port=self.db_config.port,
-                database=self.db_config.database,
-                user=self.db_config.user,
-                password=self.db_config.password
-            )
-            self.logger.info("Successfully connected to PostgreSQL database")
-            return conn
-        except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
-            raise
+        return self.db_utils.connect_to_db()
     
     def _parse_interval_value(self, value):
         """Parse interval values like '+4 LAPS' or '12.345' to float"""

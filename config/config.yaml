@@ -50,3 +50,68 @@ data_ingestion:
     - "intervals"
     - "weather"
     - "race_control"
+
+# Data Validation Configuration
+data_validation:
+  root_dir: artifacts/data_validation_pre_post
+  validation_report_dir: artifacts/data_validation_pre_post
+  data_quality_threshold: 0.95
+  missing_value_threshold: 0.1
+  outlier_threshold: 3.0
+  validate_raw_data: true
+  validate_transformed_data: true
+  generate_validation_report: true
+  save_validation_results: true
+  validation_report_format: json
+  tables_to_validate:
+    - "sessions"
+    - "drivers"
+    - "laps"
+    - "pit_stops"
+    - "stints"
+    - "positions"
+    - "intervals"
+    - "weather"
+
+# Data Transformation Configuration
+data_transformation:
+  missing_value_strategy: impute  # impute, drop, interpolate
+  outlier_strategy: context_aware  # context_aware, remove_system_errors, cap, ignore
+  outlier_threshold: 3.0
+  create_tire_features: true
+  create_lap_features: true
+  create_weather_features: true
+  create_driver_features: true
+  numeric_columns:
+    - "lap_duration"
+    - "duration_sector_1"
+    - "duration_sector_2"
+    - "duration_sector_3"
+    - "pit_duration"
+    - "lap_start"
+    - "lap_end"
+    - "tyre_age_at_start"
+    - "position"
+    - "gap_to_leader"
+    - "interval"
+    - "air_temperature"
+    - "track_temperature"
+    - "humidity"
+  categorical_columns:
+    - "compound"
+    - "flag"
+    - "category"
+    - "scope"
+  datetime_columns:
+    - "date_start"
+    - "date_end"
+    - "date"
+  tables_to_transform:
+    - "sessions"
+    - "drivers"
+    - "laps"
+    - "pit_stops"
+    - "stints"
+    - "positions"
+    - "intervals"
+    - "weather"

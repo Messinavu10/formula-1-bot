@@ -76,3 +76,88 @@ class DatabaseConfig:
     @property
     def connection_string(self) -> str:
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+
+@dataclass
+class DataValidationConfig:
+    """Configuration for data validation"""
+    root_dir: Path
+    validation_report_dir: Path
+    
+    # General validation thresholds
+    data_quality_threshold: float = 0.95
+    missing_value_threshold: float = 0.1
+    outlier_threshold: float = 3.0
+    
+    # Validation phases
+    validate_raw_data: bool = True
+    validate_transformed_data: bool = True
+    
+    # Tables to validate
+    tables_to_validate: List[str] = None
+    
+    # Report settings
+    generate_validation_report: bool = True
+    save_validation_results: bool = True
+    validation_report_format: str = "json"
+    
+    def __post_init__(self):
+        if self.tables_to_validate is None:
+            self.tables_to_validate = [
+                "meetings", "sessions", "drivers", "laps", 
+                "pit_stops", "stints", "positions", "intervals", 
+                "weather"  # Removed race_control as per your preference
+            ]
+        
+        # Create validation report directory
+        self.validation_report_dir.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class DataTransformationConfig:
+    """Configuration for data transformation"""
+    
+    # Data cleaning settings
+    missing_value_strategy: str = "impute"
+    outlier_strategy: str = "context_aware"
+    outlier_threshold: float = 3.0
+    
+    # Feature engineering settings
+    create_tire_features: bool = True
+    create_lap_features: bool = True
+    create_weather_features: bool = True
+    create_driver_features: bool = True
+    
+    # Data type settings
+    numeric_columns: List[str] = None
+    categorical_columns: List[str] = None
+    datetime_columns: List[str] = None
+    
+    # Tables to transform
+    tables_to_transform: List[str] = None
+    
+    def __post_init__(self):
+        if self.tables_to_transform is None:
+            self.tables_to_transform = [
+                "sessions", "drivers", "laps", 
+                "pit_stops", "stints", "positions", "intervals", 
+                "weather"
+            ]
+        
+        if self.numeric_columns is None:
+            self.numeric_columns = [
+                "lap_duration", "duration_sector_1", "duration_sector_2", "duration_sector_3",
+                "pit_duration", "lap_start", "lap_end", "tyre_age_at_start",
+                "position", "gap_to_leader", "interval",
+                "air_temperature", "track_temperature", "humidity"
+            ]
+        
+        if self.categorical_columns is None:
+            self.categorical_columns = [
+                "compound", "flag", "category", "scope"
+            ]
+        
+        if self.datetime_columns is None:
+            self.datetime_columns = [
+                "date_start", "date_end", "date"
+            ]
