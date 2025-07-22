@@ -28,6 +28,7 @@ data_ingestion:
     - meeting_key: "1262"  # Spanish Grand Prix
     - meeting_key: "1263"  # Canadian Grand Prix
     - meeting_key: "1264"  # Austrian Grand Prix
+    - meeting_key: "1265"  # British Grand Prix
   
   # Sessions to ingest for each meeting
   sessions_to_ingest:
@@ -115,3 +116,16 @@ data_transformation:
     - "positions"
     - "intervals"
     - "weather"
+
+mcp:
+  server_host: "localhost"
+  server_port: 8000
+  openai_api_key: "${OPENAI_API_KEY}"  # Will be loaded from env
+  langsmith_api_key: "${LANGSMITH_API_KEY}"
+  langsmith_project: "f1-mcp-bot"
+
+tools:
+  enable_sql_logging: true
+  enable_performance_metrics: true
+  max_query_results: 100
+  default_session_type: "Race"

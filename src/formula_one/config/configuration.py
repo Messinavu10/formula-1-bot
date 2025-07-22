@@ -3,6 +3,8 @@ from src.formula_one.constants import *
 from src.formula_one.utils.common import read_yaml, create_directories
 
 from src.formula_one.entity.config_entity import DataIngestionConfig, DataValidationConfig, DataTransformationConfig
+from src.formula_one.entity.mcp_config_entity import MCPConfig, ToolConfig
+from src.formula_one.utils.query_builder import QueryBuilder
 
 class ConfigurationManager:
     """Manages configuration loading from YAML files"""
@@ -10,6 +12,7 @@ class ConfigurationManager:
     def __init__(self, config_file_path: str = "config/config.yaml"):
         self.config_file_path = Path(config_file_path)
         self.config = read_yaml(self.config_file_path)
+        self.query_builder = QueryBuilder()
     
     def get_data_ingestion_config(self) -> DataIngestionConfig:
         """Get data ingestion configuration"""
@@ -84,3 +87,45 @@ class ConfigurationManager:
                 "weather"
             ])
         )
+
+    def get_mcp_config(self) -> MCPConfig:
+        """Get MCP configuration"""
+
+        config_data = self.config.get('mcp', {})
+
+        openai_api_key = os.getenv('OPENAI_API_KEY')
+
+        return MCPConfig(
+            server_host=config_data.get('server_host', 'localhost'),
+            server_port=int(config_data.get('server_port', 8000)),
+            openai_api_key=openai_api_key,
+            langsmith_api_key=config_data.get('langsmith_api_key'),
+            langsmith_project=config_data.get('langsmith_project', 'f1-mcp-bot')
+        )
+    
+    def get_tool_config(self) -> ToolConfig:
+        """Get tool configuration"""
+        config_data = self.config.get('tools', {})
+        return ToolConfig(
+            enable_sql_logging=config_data.get('enable_sql_logging', True),
+            enable_performance_metrics=config_data.get('enable_performance_metrics', True),
+            max_query_results=int(config_data.get('max_query_results', 100)),
+            default_session_type=config_data.get('default_session_type', 'Race')
+        )
+    
+    def get_query_builder(self):
+        """Get query builder instance"""
+        return self.query_builder
+    
+    def validate_config(self):
+        """Validate configuration"""
+        required_env_vars = ['OPENAI_API_KEY', 'DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
+        missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+        
+        if missing_vars:
+            raise ConfigurationError(f"Missing required environment variables: {missing_vars}")
+        
+        # Validate MCP config
+        mcp_config = self.get_mcp_config()
+        if not mcp_config.openai_api_key:
+            raise ConfigurationError("OPENAI_API_KEY is required for MCP functionality")
