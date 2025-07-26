@@ -168,25 +168,26 @@ class DatabaseUtils:
             return []
     
     def execute_mcp_query(self, query: str, params: dict = None):
-        """Execute a query for MCP tools with logging"""
+        """Execute a query for MCP tools with logging using SQLAlchemy"""
         try:
-            logger.info(f"Executing MCP query: {query[:100]}...")
-            conn = self.connect_to_db()
-            cursor = conn.cursor()
-            if params:
-                psycopg2.extras.execute_values(cursor, query, list(params.values()), page_size=1000)
-            else:
-                cursor.execute(query)
-            rows = cursor.fetchall()
-            logger.info(f"MCP query executed successfully, returned {len(rows)} rows")
-            return rows
+            logger.info(f"Executing MCP query: {query}")
+            
+            # Create SQLAlchemy engine (like the notebook)
+            engine = create_engine(self.db_config.connection_string)
+            
+            with engine.connect() as conn:
+                if params:
+                    result = conn.execute(text(query), params)
+                else:
+                    result = conn.execute(text(query))
+                
+                rows = result.fetchall()
+                logger.info(f"MCP query executed successfully, returned {len(rows)} rows")
+                return rows
         except Exception as e:
             logger.error(f"MCP query failed: {e}")
             raise
-        finally:
-            cursor.close()
-            conn.close()
-    
+        
     def get_schema_info(self):
         """Get comprehensive database schema information"""
         schema_info = {}

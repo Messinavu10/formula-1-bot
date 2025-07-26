@@ -96,7 +96,10 @@ class HTTPMCPClient(BaseComponent):
                     result = response.json()
                     if not result["success"]:
                         raise Exception(f"Tool execution failed: {result.get('error', 'Unknown error')}")
-                    return result["data"]
+                    # Return the data field, but also include success for compatibility
+                    data = result["data"]
+                    data["success"] = result["success"]  # Add success field to data
+                    return data
                 except requests.RequestException as e:
                     if attempt == retries:
                         raise Exception(f"Failed to call tool after {retries + 1} attempts: {e}")

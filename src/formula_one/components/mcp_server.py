@@ -13,6 +13,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.mcp_config_entity import MCPConfig
 from src.formula_one.entity.config_entity import DatabaseConfig
+from typing import Optional 
 
 class ToolCallRequest(BaseModel):
     name: str
@@ -21,7 +22,7 @@ class ToolCallRequest(BaseModel):
 class ToolCallResponse(BaseModel):
     success: bool
     data: Dict[str, Any]
-    error: str = None
+    error: Optional[str] = None  # Make error optional
 
 class ToolInfo(BaseModel):
     name: str
@@ -120,11 +121,12 @@ class FastAPIServer(BaseComponent):
                 return ToolCallResponse(
                     success=result.success,
                     data=result.data,
-                    error=result.error
+                    error=result.error if result.error else None  # Handle None explicitly
                 )
             except Exception as e:
                 return ToolCallResponse(
                     success=False,
+                    data={},
                     error=str(e)
                 )
         

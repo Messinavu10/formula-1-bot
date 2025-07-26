@@ -147,8 +147,36 @@ class DataTransformation(BaseComponent):
             conn.close()
     
     def _load_table_data(self, table_name: str) -> Optional[pd.DataFrame]:
-        """Load data from database table"""
-        return self.db_utils.load_table_data(table_name)
+        """Load table data with duplicate handling"""
+        try:
+            query = f"SELECT * FROM {table_name}"
+            df = pd.read_sql_query(query, self.db_utils.connect_to_db())
+            
+            if df.empty:
+                self.logger.warning(f"Table {table_name} is empty")
+                return None
+            
+            # Log initial data quality
+            self.logger.info(f"Loaded {len(df)} rows from {table_name}")
+            
+            # Check for duplicates before processing
+            if table_name == 'pit_stops':
+                duplicates = df.duplicated(subset=['session_key', 'driver_number', 'lap_number']).sum()
+            elif table_name == 'laps':
+                duplicates = df.duplicated(subset=['session_key', 'driver_number', 'lap_number']).sum()
+            elif table_name == 'positions':
+                duplicates = df.duplicated(subset=['session_key', 'driver_number', 'date']).sum()
+            else:
+                duplicates = df.duplicated().sum()
+            
+            if duplicates > 0:
+                self.logger.warning(f"Found {duplicates} duplicate records in {table_name}")
+            
+            return df
+        
+        except Exception as e:
+            self.logger.error(f"Error loading table {table_name}: {e}")
+            return None
     
     def _transform_table(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
         """Transform a specific table"""
@@ -608,18 +636,29 @@ class DataTransformation(BaseComponent):
             
             # Convert numeric columns to appropriate types
             for col in df_clean.columns:
-                if 'count' in col or 'timing' in col or 'duration' in col or 'change' in col or 'progression' in col:
+                if col in ['pit_duration', 'lap_duration', 'duration_sector_1', 'duration_sector_2', 'duration_sector_3']:
+                    # Time-related columns should be floats
+                    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0).astype('float32')
+                elif col in ['pit_stop_count', 'pit_stop_timing', 'stint_duration', 'tire_age_progression', 
+                            'position_change', 'lap_number', 'driver_number', 'session_key', 'meeting_key']:
+                    # Count/timing columns should be integers
                     df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0).astype('int32')
                 elif 'std' in col or 'mean' in col or 'deviation' in col or 'consistency' in col:
+                    # Statistical columns should be floats
                     df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0).astype('float32')
                 elif col in ['is_outlier', 'had_incident', 'safety_car_lap', 
                             'normal_pit_stop', 'long_pit_stop', 'penalty_pit_stop', 'is_leader', 'is_retired', 
                             'is_lapped', 'extreme_weather']:
+                    # Boolean columns
                     df_clean[col] = df_clean[col].fillna(False).astype('bool')
                 elif col.endswith('_encoded'):
+                    # Encoded columns should be integers
                     df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0).astype('int32')
                 elif col == 'outlier_type':
+                    # String column
                     df_clean[col] = df_clean[col].fillna('normal')
+            
+            df_clean = self._remove_duplicates(df_clean, table_name)
             
             # Clear existing data
             cursor.execute(f"DELETE FROM {table_name}_transformed")
@@ -641,6 +680,48 @@ class DataTransformation(BaseComponent):
         finally:
             cursor.close()
             conn.close()
+    
+    def _remove_duplicates(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
+        """Remove duplicates based on table-specific logic"""
+        
+        if table_name == 'pit_stops':
+            # Remove duplicates based on session_key, driver_number, lap_number
+            df_clean = df.drop_duplicates(
+                subset=['session_key', 'driver_number', 'lap_number'], 
+                keep='first'
+            )
+            self.logger.info(f"Removed {len(df) - len(df_clean)} duplicate pit stop records")
+            
+        elif table_name == 'laps':
+            # Remove duplicates based on session_key, driver_number, lap_number
+            df_clean = df.drop_duplicates(
+                subset=['session_key', 'driver_number', 'lap_number'], 
+                keep='first'
+            )
+            self.logger.info(f"Removed {len(df) - len(df_clean)} duplicate lap records")
+            
+        elif table_name == 'positions':
+            # Remove duplicates based on session_key, driver_number, date
+            df_clean = df.drop_duplicates(
+                subset=['session_key', 'driver_number', 'date'], 
+                keep='first'
+            )
+            self.logger.info(f"Removed {len(df) - len(df_clean)} duplicate position records")
+            
+        elif table_name == 'stints':
+            # Remove duplicates based on session_key, driver_number, lap_start, lap_end
+            df_clean = df.drop_duplicates(
+                subset=['session_key', 'driver_number', 'lap_start', 'lap_end'], 
+                keep='first'
+            )
+            self.logger.info(f"Removed {len(df) - len(df_clean)} duplicate stint records")
+            
+        else:
+            # For other tables, remove exact duplicates
+            df_clean = df.drop_duplicates()
+            self.logger.info(f"Removed {len(df) - len(df_clean)} duplicate records from {table_name}")
+        
+        return df_clean
     
     def _load_all_transformed_data(self) -> Dict[str, pd.DataFrame]:
         """Load all transformed data from database"""

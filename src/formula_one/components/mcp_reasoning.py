@@ -6,16 +6,74 @@ from langchain.schema import HumanMessage, SystemMessage
 import json
 import time
 import os
+import numpy as np
 
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.entity.mcp_config_entity import MCPConfig
+from sentence_transformers import SentenceTransformer
+
 
 class IntentAnalyzer(BaseComponent):
     """Analyze user query intent and extract information"""
     
     def __init__(self, config, db_config: DatabaseConfig):
         super().__init__(config, db_config)
+
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Define intent patterns with examples
+        self.intent_patterns = {
+            "comparison": [
+                "compare", "vs", "versus", "difference", "who was better",
+                "how did X compare to Y", "which driver was faster", "compare X and Y"
+            ],
+            "driver_performance": [
+                "driver performance", "how did X perform", "what was X's performance",
+                "driver analysis", "driver stats", "driver data"
+            ],
+            "team_performance": [
+                "team performance", "how did X team perform", "team analysis",
+                "team stats", "team data", "mercedes team performance", "ferrari team performance",
+                "mclaren team performance", "red bull team performance", "williams team performance"
+            ],
+            "fastest_lap": [
+                "fastest lap", "best lap", "quickest", "fastest time",
+                "best lap time", "quickest lap"
+            ],
+            "sector_analysis": [
+                "sector", "sectors", "sector times", "sector analysis", "sector performance",
+                "sector 1", "sector 2", "sector 3", "first sector", "second sector", "third sector",
+                "sector strengths", "sector weaknesses", "best sector", "worst sector",
+                "sector consistency", "sector comparison", "sector breakdown"
+            ],
+            "tire_strategy": [
+                "tire strategy", "tyre strategy", "compound", "tire management",
+                "tyre management", "stints", "tire compounds", "tyre compounds"
+            ],
+            "pit_strategy": [
+                "pit stop", "pitstop", "stops", "fastest pitstop",
+                "pit strategy", "when did they pit", "how many stops"
+            ],
+            "incident_investigation": [
+                "incident", "accident", "crash", "what happened", "what happened on lap",
+                "incident on lap", "crash on lap", "accident on lap", "what went wrong",
+                "problem on lap", "issue on lap", "slow lap", "unusual", "strange"
+            ],
+            "qualifying_results": [
+                "qualifying", "quali", "grid", "pole", "qualifying results",
+                "starting position", "grid position"
+            ],
+            "race_results": [
+                "race results", "who won", "podium", "finishing position",
+                "race outcome", "final results"
+            ]
+        }
+        
+        # Pre-compute embeddings for all patterns
+        self.pattern_embeddings = {}
+        for intent, patterns in self.intent_patterns.items():
+            self.pattern_embeddings[intent] = self.model.encode(patterns)
     
     def analyze_query_intent(self, user_query: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
         """Analyze what the user is asking for with conversation context"""
@@ -34,12 +92,41 @@ class IntentAnalyzer(BaseComponent):
         # Determine query type
         query_type = self._determine_query_type(query_lower)
         
+
+        # Extract lap number for incident investigation
+        lap_number = self._extract_lap_number(user_query) if query_type == "incident_investigation" else None
+
         return {
             "meeting_info": meeting_info,
             "session_type": session_type,
             "query_type": query_type,
-            "drivers": self._extract_driver_names(user_query)
+            "drivers": self._extract_driver_names(user_query),
+            "lap_number": lap_number
         }
+    
+    def _extract_lap_number(self, query: str) -> Optional[int]:
+        """Extract lap number from query"""
+        import re
+        query_lower = query.lower()
+        
+        # Look for patterns like "lap 10", "lap 5", etc.
+        lap_patterns = [
+            r'lap\s+(\d+)',
+            r'on\s+lap\s+(\d+)',
+            r'incident\s+on\s+lap\s+(\d+)',
+            r'what\s+happened\s+on\s+lap\s+(\d+)',
+            r'crash\s+on\s+lap\s+(\d+)',
+            r'accident\s+on\s+lap\s+(\d+)',
+            r'problem\s+on\s+lap\s+(\d+)',
+            r'issue\s+on\s+lap\s+(\d+)'
+        ]
+        
+        for pattern in lap_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                return int(match.group(1))
+        
+        return None
     
     def _extract_meeting_info(self, query: str) -> Dict[str, Any]:
         """Extract meeting name and year from query"""
@@ -112,21 +199,81 @@ class IntentAnalyzer(BaseComponent):
                 return "Practice"
         else:
             return "Race"
-    
+
     def _determine_query_type(self, query_lower: str) -> str:
-        """Determine query type from query"""
-        if any(word in query_lower for word in ["compare", "vs", "versus", "difference"]):
-            return "comparison"
-        elif any(word in query_lower for word in ["performance", "how did", "analysis"]):
-            return "performance"
-        elif any(word in query_lower for word in ["fastest lap", "best lap", "quickest"]):
-            return "fastest_lap"
-        elif any(word in query_lower for word in ["pit stop", "strategy", "stops", "stints"]):
-            return "strategy"
-        elif any(word in query_lower for word in ["qualifying", "quali", "grid", "pole"]):
-            return "qualifying_results"
-        else:
+        """Determine query type using semantic similarity with priority logic"""
+        
+        # First, check for explicit comparison keywords (highest priority)
+        comparison_keywords = ["compare", "vs", "versus", "difference", "who was better", "which driver was faster"]
+        for keyword in comparison_keywords:
+            if keyword in query_lower:
+                return "comparison"
+        
+        # Check for lap-related incident keywords (more flexible)
+        lap_incident_keywords = [
+            "what happened on lap",
+            "what happened to",
+            "incident on lap", 
+            "crash on lap", 
+            "accident on lap",
+            "what happened",
+            "incident",
+            "crash",
+            "accident"
+        ]
+        
+        # Check if query contains both lap number and incident keywords
+        import re
+        has_lap_number = bool(re.search(r'\blap\s+\d+', query_lower))
+        has_incident_keyword = any(keyword in query_lower for keyword in lap_incident_keywords)
+        
+        if has_lap_number and has_incident_keyword:
+            return "incident_investigation"
+        
+        # Check for sector analysis keywords
+        sector_keywords = [
+            "sector", "sectors", "sector times", "sector analysis", "sector performance",
+            "sector 1", "sector 2", "sector 3", "first sector", "second sector", "third sector",
+            "sector strengths", "sector weaknesses", "best sector", "worst sector",
+            "sector consistency", "sector comparison", "sector breakdown"
+        ]
+        for keyword in sector_keywords:
+            if keyword in query_lower:
+                return "sector_analysis"
+        
+        # Check for explicit team performance keywords
+        team_keywords = ["team performance", "team analysis", "team stats", "team data"]
+        for keyword in team_keywords:
+            if keyword in query_lower:
+                return "team_performance"
+        
+        # Check for driver performance keywords
+        driver_keywords = ["driver performance", "driver analysis", "driver stats", "driver data"]
+        for keyword in driver_keywords:
+            if keyword in query_lower:
+                return "driver_performance"
+        
+        # If no explicit keywords, use semantic similarity
+        query_embedding = self.model.encode([query_lower])
+        
+        best_intent = "race_results"  # default
+        best_score = 0
+        
+        # Compare query with each intent pattern
+        for intent, pattern_embeddings in self.pattern_embeddings.items():
+            # Calculate cosine similarity between query and all patterns for this intent
+            similarities = np.dot(pattern_embeddings, query_embedding.T).flatten()
+            max_similarity = np.max(similarities)
+            
+            if max_similarity > best_score:
+                best_score = max_similarity
+                best_intent = intent
+        
+        # Set a threshold - if no good match, default to race_results
+        if best_score < 0.3:  # Adjust threshold as needed
             return "race_results"
+
+        return best_intent
     
     def _extract_driver_names(self, query: str) -> List[str]:
         """Extract driver names from query"""
@@ -163,7 +310,7 @@ class IntentAnalyzer(BaseComponent):
                         found_drivers.append(full_name)
                     break
         
-        return found_drivers[:2]
+        return found_drivers 
 
 class ContextManager(BaseComponent):
     """Manage conversation context and clarification handling"""
@@ -462,19 +609,29 @@ class ReasoningEngine(BaseComponent):
             drivers = query_analysis["drivers"]
             
             if query_type == "comparison":
-                if len(drivers) >= 2:
+                # Check if it's a team comparison
+                teams = self._extract_team_names(user_query)
+                if len(teams) >= 2:
+                    # Pass all teams to the tool
+                    tool_results["team_comparison"] = self.http_client.call_tool("compare_teams", {
+                        "session_key": session_key,
+                        "teams": teams,  # Pass the full list of teams
+                        "comparison_metrics": ["all"]
+                    })
+                    if "sql_query" in tool_results["team_comparison"]:
+                        sql_queries.append({"tool": "compare_teams", "query": tool_results["team_comparison"]["sql_query"], "params": tool_results["team_comparison"].get("sql_params", {})})
+                elif len(drivers) >= 2:
                     tool_results["driver_comparison"] = self.http_client.call_tool("compare_drivers", {
                         "session_key": session_key,
-                        "driver1": drivers[0],
-                        "driver2": drivers[1],
+                        "drivers": drivers,
                         "comparison_metrics": ["all"]
                     })
                     if "sql_query" in tool_results["driver_comparison"]:
                         sql_queries.append({"tool": "compare_drivers", "query": tool_results["driver_comparison"]["sql_query"], "params": tool_results["driver_comparison"].get("sql_params", {})})
                 else:
-                    tool_results["error"] = f"Need two drivers to compare. Found: {drivers}"
+                    tool_results["error"] = f"Need two or more drivers or teams to compare. Found drivers: {drivers}, teams: {teams}"
             
-            elif query_type == "performance":
+            elif query_type == "driver_performance":
                 if len(drivers) >= 1:
                     tool_results["driver_performance"] = self.http_client.call_tool("get_driver_performance", {
                         "session_key": session_key,
@@ -485,7 +642,20 @@ class ReasoningEngine(BaseComponent):
                         sql_queries.append({"tool": "get_driver_performance", "query": tool_results["driver_performance"]["sql_query"], "params": tool_results["driver_performance"].get("sql_params", {})})
                 else:
                     tool_results["error"] = "Need to specify a driver for performance analysis"
-            
+
+            elif query_type == "team_performance":
+                # Extract team name from query
+                team_name = self._extract_team_names(user_query)
+                if team_name:
+                    tool_results["team_performance"] = self.http_client.call_tool("get_team_performance", {
+                        "session_key": session_key,
+                        "team_name": team_name  # Changed from "team_filter" to "team_name"
+                    })
+                    if "sql_query" in tool_results["team_performance"]:
+                        sql_queries.append({"tool": "get_team_performance", "query": tool_results["team_performance"]["sql_query"], "params": tool_results["team_performance"].get("sql_params", {})})
+                else:
+                    tool_results["error"] = "Need to specify a team for performance analysis"
+                        
             elif query_type == "fastest_lap":
                 tool_results["fastest_lap"] = self.http_client.call_tool("get_fastest_lap", {
                     "session_key": session_key
@@ -493,13 +663,74 @@ class ReasoningEngine(BaseComponent):
                 if "sql_query" in tool_results["fastest_lap"]:
                     sql_queries.append({"tool": "get_fastest_lap", "query": tool_results["fastest_lap"]["sql_query"], "params": tool_results["fastest_lap"].get("sql_params", {})})
             
-            elif query_type == "strategy":
+            elif query_type == "tire_strategy":
+                # Extract team or driver filter
+                teams = self._extract_team_names(user_query)
+                drivers = query_analysis["drivers"]
+                
+                tool_results["tire_strategy"] = self.http_client.call_tool("get_tire_strategy", {
+                    "session_key": session_key,
+                    "team_filter": teams[0] if teams else None,
+                    "driver_filter": drivers[0] if drivers else None,
+                    "strategy_type": "all"
+                })
+                if "sql_query" in tool_results["tire_strategy"]:
+                    sql_queries.append({"tool": "get_tire_strategy", "query": tool_results["tire_strategy"]["sql_query"], "params": tool_results["tire_strategy"].get("sql_params", {})})
+
+            elif query_type == "pit_strategy":
                 tool_results["pit_stop_analysis"] = self.http_client.call_tool("get_pit_stop_analysis", {
                     "session_key": session_key,
                     "analysis_type": "all"
                 })
                 if "sql_query" in tool_results["pit_stop_analysis"]:
                     sql_queries.append({"tool": "get_pit_stop_analysis", "query": tool_results["pit_stop_analysis"]["sql_query"], "params": tool_results["pit_stop_analysis"].get("sql_params", {})})
+            
+            elif query_type == "incident_investigation":
+                lap_number = query_analysis.get("lap_number")
+                drivers = query_analysis["drivers"]
+                
+                # Determine analysis type based on query
+                if drivers and lap_number:
+                    analysis_type = "driver_specific_lap"
+                elif drivers:
+                    analysis_type = "driver"
+                elif lap_number:
+                    analysis_type = "specific_lap"
+                else:
+                    analysis_type = "summary"
+                
+                tool_results["incident_analysis"] = self.http_client.call_tool("investigate_incident", {
+                    "session_key": session_key,
+                    "driver_name": drivers[0] if drivers else None,
+                    "lap_number": lap_number,
+                    "analysis_type": analysis_type
+                })
+                if "sql_query" in tool_results["incident_analysis"]:
+                    sql_queries.append({"tool": "investigate_incident", "query": tool_results["incident_analysis"]["sql_query"], "params": tool_results["incident_analysis"].get("sql_params", {})})
+            
+            elif query_type == "sector_analysis":
+                drivers = query_analysis["drivers"]
+                teams = self._extract_team_names(user_query)
+                
+                # Determine sector analysis type based on query
+                query_lower = user_query.lower()
+                if any(word in query_lower for word in ["consistency", "consistent", "reliability"]):
+                    sector_analysis_type = "consistency"
+                elif any(word in query_lower for word in ["compare", "comparison", "vs", "versus"]):
+                    sector_analysis_type = "comparison"
+                elif any(word in query_lower for word in ["best", "fastest", "quickest"]):
+                    sector_analysis_type = "best_sectors"
+                else:
+                    sector_analysis_type = "all"
+                
+                tool_results["sector_analysis"] = self.http_client.call_tool("get_sector_analysis", {
+                    "session_key": session_key,
+                    "driver_filter": drivers[0] if drivers else None,
+                    "team_filter": teams[0] if teams else None,
+                    "sector_analysis_type": sector_analysis_type
+                })
+                if "sql_query" in tool_results["sector_analysis"]:
+                    sql_queries.append({"tool": "get_sector_analysis", "query": tool_results["sector_analysis"]["sql_query"], "params": tool_results["sector_analysis"].get("sql_params", {})})
             
             elif query_type == "qualifying_results":
                 tool_results["qualifying_results"] = self.http_client.call_tool("get_qualifying_results", {
@@ -510,9 +741,12 @@ class ReasoningEngine(BaseComponent):
                     sql_queries.append({"tool": "get_qualifying_results", "query": tool_results["qualifying_results"]["sql_query"], "params": tool_results["qualifying_results"].get("sql_params", {})})
             
             else:  # race_results
+                # Extract number from query to determine result type
+                result_type = self._determine_race_result_type(user_query)
+                
                 tool_results["race_results"] = self.http_client.call_tool("get_race_results", {
                     "session_key": session_key,
-                    "result_type": "podium",
+                    "result_type": result_type,
                     "include_lap_times": True
                 })
                 if "sql_query" in tool_results["race_results"]:
@@ -525,6 +759,65 @@ class ReasoningEngine(BaseComponent):
             tool_results["error"] = str(e)
             self.logger.error(f"❌ Error executing tools: {e}")
             return tool_results
+    
+        
+    def _extract_team_names(self, query: str) -> List[str]:
+        """Extract team names from query"""
+        team_mappings = {
+            "mercedes": "Mercedes",
+            "ferrari": "Ferrari", 
+            "mclaren": "McLaren",
+            "red bull": "Red Bull Racing",
+            "redbull": "Red Bull Racing",
+            "red bull racing": "Red Bull Racing",
+            "williams": "Williams",
+            "alpine": "Alpine",
+            "aston martin": "Aston Martin",
+            "astonmartin": "Aston Martin",
+            "haas": "Haas F1 Team",
+            "haas f1": "Haas F1 Team",
+            "rb": "Racing Bulls",
+            "bulls": "Racing Bulls",
+            "racing bulls": "Racing Bulls",
+            "sauber": "Sauber",
+            "stake": "Stake F1 Team",
+            "stake f1": "Stake F1 Team"
+        }
+        
+        query_lower = query.lower()
+        found_teams = []
+        
+        for team_alias, team_name in team_mappings.items():
+            if team_alias in query_lower:
+                if team_name not in found_teams:
+                    found_teams.append(team_name)
+        
+        return found_teams
+    
+    def _determine_race_result_type(self, query: str) -> str:
+        """Determine the result type based on the user query"""
+        query_lower = query.lower()
+        
+        # Check for specific numbers
+        import re
+        numbers = re.findall(r'\d+', query_lower)
+        
+        if numbers:
+            num = int(numbers[0])
+            if num == 1:
+                return "winner_only"
+            elif num == 3:
+                return "podium"
+            else:
+                return f"top_{num}"  # Dynamic result type
+        
+        # Check for keywords
+        if any(word in query_lower for word in ["winner", "won", "first"]):
+            return "winner_only"
+        elif any(word in query_lower for word in ["podium", "top 3", "first 3"]):
+            return "podium"
+        else:
+            return "podium" 
     
     def _generate_intelligent_summary(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any]) -> str:
         """Generate an intelligent text summary using LLM"""
@@ -568,6 +861,7 @@ IMPORTANT:
 - Focus on facts: who, what times, what positions
 - Maximum 3-4 sentences per response
 - When displaying lap times, use MM:SS.mmm format
+- If multiple fastest laps are provided, list them in order as a list with each entry as a new line from fastest to slowest
 
 IMPORTANT: When displaying lap times, use the format MM:SS.mmm (e.g., 01:33.614, 01:30.000, 01:35.123). Do NOT mix words and numbers for times.
 

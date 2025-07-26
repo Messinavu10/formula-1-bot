@@ -40,9 +40,16 @@ class GetMeetingKeyTool(BaseMCPTool):
             self.logger.info(f"Executing GetMeetingKeyTool for {event_name} {year}")
             
             query = self.query_builder.build_meeting_query(event_name, year)
-            result = self.db_connection.execute_query(query)
             
-            if result:
+            # Fix: Add wildcards like the notebook does
+            search_params = {
+                "event_name": f"%{event_name}%",  # Add wildcards
+                "year": year
+            }
+            
+            result = self.db_connection.execute_mcp_query(query, search_params)
+            
+            if result and len(result) > 0:
                 row = result[0]
                 data = {
                     "meeting_key": row[0],
@@ -59,7 +66,7 @@ class GetMeetingKeyTool(BaseMCPTool):
                     success=True,
                     data=data,
                     sql_query=query,
-                    sql_params={"event_name": event_name, "year": year},
+                    sql_params=search_params,
                     execution_time=execution_time
                 )
             else:
@@ -68,9 +75,10 @@ class GetMeetingKeyTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error=f"No meeting found for '{event_name}' in {year}",
                     sql_query=query,
-                    sql_params={"event_name": event_name, "year": year},
+                    sql_params=search_params,
                     execution_time=execution_time
                 )
                 
@@ -80,6 +88,7 @@ class GetMeetingKeyTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
@@ -98,7 +107,16 @@ class GetSessionKeyTool(BaseMCPTool):
             self.logger.info(f"Executing GetSessionKeyTool for meeting {meeting_key}, session {session_type}")
             
             query = self.query_builder.build_session_query(meeting_key, session_type)
-            result = self.db_connection.execute_query(query)
+            
+            # Fix: Pass correct parameters based on session type
+            if session_type.lower() in ["qualifying", "qual"]:
+                # For qualifying, we need to create a pattern
+                session_type_pattern = f"%{session_type}%"
+                db_params = {"meeting_key": meeting_key, "session_type": session_type_pattern}
+            else:
+                db_params = {"meeting_key": meeting_key, "session_type": session_type}
+            
+            result = self.db_connection.execute_mcp_query(query, db_params)
             
             if result:
                 row = result[0]
@@ -118,7 +136,7 @@ class GetSessionKeyTool(BaseMCPTool):
                     success=True,
                     data=data,
                     sql_query=query,
-                    sql_params={"meeting_key": meeting_key, "session_type": session_type},
+                    sql_params=db_params,
                     execution_time=execution_time
                 )
             else:
@@ -127,9 +145,10 @@ class GetSessionKeyTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error=f"No {session_type} session found for meeting {meeting_key}",
                     sql_query=query,
-                    sql_params={"meeting_key": meeting_key, "session_type": session_type},
+                    sql_params=db_params,
                     execution_time=execution_time
                 )
                 
@@ -139,6 +158,7 @@ class GetSessionKeyTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
@@ -158,19 +178,37 @@ class GetFastestLapTool(BaseMCPTool):
             self.logger.info(f"Executing GetFastestLapTool for session {session_key}")
             
             query = self.query_builder.build_fastest_lap_query(session_key, driver_filter, team_filter)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key, "driver_filter": driver_filter, "team_filter": team_filter})
             
             if result:
-                row = result[0]
+                # Handle multiple results - return all fastest laps
+                fastest_laps = []
+                for row in result:
+                    fastest_laps.append({
+                        "driver": row[1],                    # full_name
+                        "team": row[2],                      # team_name
+                        "lap_time": float(row[4]) if row[4] else None,  # lap_duration
+                        "lap_number": row[3],                # lap_number
+                        "sector1": float(row[5]) if row[5] else None,   # duration_sector_1
+                        "sector2": float(row[6]) if row[6] else None,   # duration_sector_2
+                        "sector3": float(row[7]) if row[7] else None,   # duration_sector_3
+                    })
+                
+                # Sort by lap time to get the fastest first
+                fastest_laps.sort(key=lambda x: x['lap_time'] if x['lap_time'] else float('inf'))
+                
                 data = {
-                    "driver": row[0],
-                    "team": row[1],
-                    "fastest_lap": float(row[2]) if row[2] else None,
-                    "lap_number": row[3],
-                    "sector1": float(row[4]) if row[4] else None,
-                    "sector2": float(row[5]) if row[5] else None,
-                    "sector3": float(row[6]) if row[6] else None,
-                    "session_key": session_key
+                    "fastest_laps": fastest_laps,
+                    "count": len(fastest_laps),
+                    "session_key": session_key,
+                    # Keep backward compatibility
+                    "driver": fastest_laps[0]["driver"] if fastest_laps else None,
+                    "team": fastest_laps[0]["team"] if fastest_laps else None,
+                    "fastest_lap": fastest_laps[0]["lap_time"] if fastest_laps else None,
+                    "lap_number": fastest_laps[0]["lap_number"] if fastest_laps else None,
+                    "sector1": fastest_laps[0]["sector1"] if fastest_laps else None,
+                    "sector2": fastest_laps[0]["sector2"] if fastest_laps else None,
+                    "sector3": fastest_laps[0]["sector3"] if fastest_laps else None,
                 }
                 
                 execution_time = time.time() - start_time
@@ -189,6 +227,7 @@ class GetFastestLapTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error="No fastest lap found",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -201,6 +240,7 @@ class GetFastestLapTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
@@ -220,7 +260,7 @@ class GetDriverPerformanceTool(BaseMCPTool):
             self.logger.info(f"Executing GetDriverPerformanceTool for {driver_name} in session {session_key}")
             
             query = self.query_builder.build_driver_performance_query(session_key, driver_name, metrics)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key, "driver_name": driver_name})
             
             if result:
                 performance_data = []
@@ -257,6 +297,7 @@ class GetDriverPerformanceTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error=f"No performance data found for {driver_name}",
                     sql_query=query,
                     sql_params={"session_key": session_key, "driver_name": driver_name},
@@ -269,6 +310,7 @@ class GetDriverPerformanceTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
@@ -288,30 +330,29 @@ class GetTeamPerformanceTool(BaseMCPTool):
             self.logger.info(f"Executing GetTeamPerformanceTool for {team_name} in session {session_key}")
             
             query = self.query_builder.build_team_performance_query(session_key, team_name, metrics)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {
+                "session_key": session_key, 
+                "team_name_pattern": f"%{team_name}%"
+            })
             
             if result:
-                team_data = []
-                for row in result:
-                    team_data.append({
-                        "driver": row[0],
-                        "total_laps": row[1],
-                        "avg_lap": float(row[2]) if row[2] else None,
-                        "best_lap": float(row[3]) if row[3] else None,
-                        "position": row[4],
-                        "consistency": float(row[5]) if row[5] else None
-                    })
+                row = result[0]  # Only one row per team
+                data = {
+                    "team": row[0],                    # team_name
+                    "total_laps": row[1],              # total_laps
+                    "avg_lap": float(row[2]) if row[2] else None,  # avg_lap
+                    "best_lap": float(row[3]) if row[3] else None,  # best_lap
+                    "consistency": float(row[4]) if row[4] else None,  # consistency
+                    "driver_positions": row[5],        # driver_positions array
+                    "driver_names": row[6]             # driver_names array
+                }
                 
                 execution_time = time.time() - start_time
                 self.logger.info(f"GetTeamPerformanceTool completed successfully in {execution_time:.3f}s")
                 
                 return ToolResult(
                     success=True,
-                    data={
-                        "team": team_name,
-                        "drivers": team_data,
-                        "metrics": metrics
-                    },
+                    data=data,
                     sql_query=query,
                     sql_params={"session_key": session_key, "team_name": team_name, "metrics": metrics},
                     execution_time=execution_time
@@ -322,6 +363,7 @@ class GetTeamPerformanceTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error=f"No team data found for {team_name}",
                     sql_query=query,
                     sql_params={"session_key": session_key, "team_name": team_name},
@@ -334,12 +376,13 @@ class GetTeamPerformanceTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
 
 class CompareDriversTool(BaseMCPTool):
-    """Compare performance between two drivers"""
+    """Compare performance between multiple drivers"""
     category = "comparison"
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -347,13 +390,19 @@ class CompareDriversTool(BaseMCPTool):
         
         try:
             session_key = params.get("session_key")
-            driver1 = params.get("driver1")
-            driver2 = params.get("driver2")
+            drivers = params.get("drivers")  # Now expects a list of drivers
+            comparison_metrics = params.get("comparison_metrics", ["all"])
             
-            self.logger.info(f"Executing CompareDriversTool for {driver1} vs {driver2} in session {session_key}")
+            self.logger.info(f"Executing CompareDriversTool for {drivers} in session {session_key}")
             
-            query = self.query_builder.build_driver_comparison_query(session_key, driver1, driver2)
-            result = self.db_connection.execute_query(query)
+            query = self.query_builder.build_driver_comparison_query(session_key, drivers, comparison_metrics)
+            
+            # Build parameters for the query
+            query_params = {"session_key": session_key}
+            for i, driver in enumerate(drivers):
+                query_params[f"driver{i+1}"] = driver
+            
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 driver_data = []
@@ -376,22 +425,23 @@ class CompareDriversTool(BaseMCPTool):
                     success=True,
                     data={
                         "comparison": driver_data,
-                        "driver1": driver1,
-                        "driver2": driver2
+                        "drivers": drivers,  # Return all drivers
+                        "metrics": comparison_metrics
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver1": driver1, "driver2": driver2},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
                 execution_time = time.time() - start_time
-                self.logger.warning(f"CompareDriversTool: No comparison data found for {driver1} vs {driver2}")
+                self.logger.warning(f"CompareDriversTool: No comparison data found for {drivers}")
                 
                 return ToolResult(
                     success=False,
-                    error=f"No comparison data found for {driver1} vs {driver2}",
+                    data={},
+                    error=f"No comparison data found for {drivers}",
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver1": driver1, "driver2": driver2},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -401,12 +451,13 @@ class CompareDriversTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
 
 class CompareTeamsTool(BaseMCPTool):
-    """Compare performance between two teams in a session"""
+    """Compare performance between multiple teams in a session"""
     category = "comparison"
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -414,26 +465,41 @@ class CompareTeamsTool(BaseMCPTool):
         
         try:
             session_key = params.get("session_key")
-            team1 = params.get("team1")
-            team2 = params.get("team2")
+            teams = params.get("teams")  # Now expects a list of teams
             comparison_metrics = params.get("comparison_metrics", ["all"])
             
-            self.logger.info(f"Executing CompareTeamsTool for {team1} vs {team2} in session {session_key}")
+            self.logger.info(f"Executing CompareTeamsTool for {teams} in session {session_key}")
             
-            query = self.query_builder.build_team_comparison_query(session_key, team1, team2, comparison_metrics)
-            result = self.db_connection.execute_query(query)
+            query = self.query_builder.build_team_comparison_query(session_key, teams, comparison_metrics)
+            
+            # Build parameters for the query
+            query_params = {"session_key": session_key}
+            for i, team in enumerate(teams):
+                query_params[f"team{i+1}_pattern"] = f"%{team}%"
+            
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 team_data = []
+                driver_data = []
+                
                 for row in result:
-                    team_data.append({
-                        "team": row[0],
-                        "best_lap": float(row[1]) if row[1] else None,
-                        "avg_lap": float(row[2]) if row[2] else None,
-                        "consistency": float(row[3]) if row[3] else None,
-                        "best_position": row[4],
-                        "avg_position": float(row[5]) if row[5] else None
-                    })
+                    data_item = {
+                        "level": row[0],                    # 'team' or 'driver'
+                        "team_name": row[1],                # team_name
+                        "driver_name": row[2],              # full_name (NULL for team level)
+                        "total_laps": row[3],               # total_laps
+                        "avg_lap": float(row[4]) if row[4] else None,  # avg_lap
+                        "best_lap": float(row[5]) if row[5] else None,  # best_lap
+                        "consistency": float(row[6]) if row[6] else None,  # consistency
+                        "best_position": row[7],            # best_position
+                        "avg_position": float(row[8]) if row[8] else None  # avg_position
+                    }
+                    
+                    if row[0] == 'team':
+                        team_data.append(data_item)
+                    else:
+                        driver_data.append(data_item)
                 
                 execution_time = time.time() - start_time
                 self.logger.info(f"CompareTeamsTool completed successfully in {execution_time:.3f}s")
@@ -441,24 +507,25 @@ class CompareTeamsTool(BaseMCPTool):
                 return ToolResult(
                     success=True,
                     data={
-                        "comparison": team_data,
-                        "team1": team1,
-                        "team2": team2,
+                        "team_comparison": team_data,
+                        "driver_breakdown": driver_data,
+                        "teams": teams,  # Return all teams
                         "metrics": comparison_metrics
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "team1": team1, "team2": team2},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
                 execution_time = time.time() - start_time
-                self.logger.warning(f"CompareTeamsTool: No comparison data found for {team1} vs {team2}")
+                self.logger.warning(f"CompareTeamsTool: No comparison data found for {teams}")
                 
                 return ToolResult(
                     success=False,
-                    error=f"No comparison data found for {team1} vs {team2}",
+                    data={},
+                    error=f"No comparison data found for {teams}",
                     sql_query=query,
-                    sql_params={"session_key": session_key, "team1": team1, "team2": team2},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -468,6 +535,7 @@ class CompareTeamsTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -487,7 +555,7 @@ class GetRaceResultsTool(BaseMCPTool):
             self.logger.info(f"Executing GetRaceResultsTool for session {session_key}, type {result_type}")
             
             query = self.query_builder.build_race_results_query(session_key, result_type, include_lap_times)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key})
             
             if result:
                 results = []
@@ -524,6 +592,7 @@ class GetRaceResultsTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={},
                     error="No race results found",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -536,6 +605,7 @@ class GetRaceResultsTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={},
                 error=str(e),
                 execution_time=execution_time
             )
@@ -554,7 +624,7 @@ class GetQualifyingResultsTool(BaseMCPTool):
             self.logger.info(f"Executing GetQualifyingResultsTool for session {session_key}, type {result_type}")
             
             query = self.query_builder.build_qualifying_results_query(session_key, result_type)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key})
             
             if result:
                 results = []
@@ -588,6 +658,7 @@ class GetQualifyingResultsTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error="No qualifying results found",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -600,6 +671,7 @@ class GetQualifyingResultsTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -620,18 +692,27 @@ class GetPitStopAnalysisTool(BaseMCPTool):
             self.logger.info(f"Executing GetPitStopAnalysisTool for session {session_key}")
             
             query = self.query_builder.build_pit_stop_analysis_query(session_key, driver_filter, team_filter, analysis_type)
-            result = self.db_connection.execute_query(query)
+            params = {"session_key": session_key}
+            if driver_filter:
+                params["driver_filter"] = driver_filter
+            if team_filter:
+                params["team_filter"] = team_filter
+
+            result = self.db_connection.execute_mcp_query(query, params)
             
             if result:
                 pit_stops = []
                 for row in result:
                     pit_stops.append({
-                        "driver": row[0],
-                        "team": row[1],
-                        "lap": row[2],
-                        "duration": float(row[3]) if row[3] else None,
-                        "stop_number": row[4],
-                        "tire_compound": row[5] if len(row) > 5 else None
+                        "driver": row[0],                    # full_name
+                        "team": row[1],                      # team_name
+                        "lap_number": row[2],                # lap_number
+                        "pit_duration": float(row[3]) if row[3] else None,  # pit_duration
+                        "is_normal": row[4],                 # normal_pit_stop
+                        "is_long": row[5],                   # long_pit_stop
+                        "is_penalty": row[6],                # penalty_pit_stop
+                        "is_outlier": row[7],                # is_outlier
+                        "timestamp": row[8]                  # created_at
                     })
                 
                 execution_time = time.time() - start_time
@@ -653,6 +734,7 @@ class GetPitStopAnalysisTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error="No pit stop data found",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -665,6 +747,7 @@ class GetPitStopAnalysisTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -685,20 +768,28 @@ class GetTireStrategyTool(BaseMCPTool):
             self.logger.info(f"Executing GetTireStrategyTool for session {session_key}")
             
             query = self.query_builder.build_tire_strategy_query(session_key, driver_filter, team_filter, strategy_type)
-            result = self.db_connection.execute_query(query)
+            
+            # Build parameters for the query
+            query_params = {"session_key": session_key}
+            if driver_filter:
+                query_params["driver_filter"] = driver_filter
+            if team_filter:
+                query_params["team_filter_pattern"] = f"%{team_filter}%"
+
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 stints = []
                 for row in result:
                     stints.append({
-                        "driver": row[0],
-                        "team": row[1],
-                        "stint_number": row[2],
-                        "start_lap": row[3],
-                        "end_lap": row[4],
-                        "tire_compound": row[5],
-                        "stint_length": row[6],
-                        "avg_lap_time": float(row[7]) if row[7] else None
+                        "driver": row[0],                    # full_name
+                        "team": row[1],                      # team_name
+                        "stint_number": row[2],              # stint_number
+                        "start_lap": row[3],                 # start_lap
+                        "end_lap": row[4],                   # end_lap
+                        "tire_compound": row[5],             # tire_compound
+                        "stint_length": row[6],              # stint_length
+                        "avg_lap_time": float(row[7]) if row[7] else None  # avg_lap_time
                     })
                 
                 execution_time = time.time() - start_time
@@ -707,11 +798,13 @@ class GetTireStrategyTool(BaseMCPTool):
                 return ToolResult(
                     success=True,
                     data={
-                        strategy_type: strategy_type,
-                        "stints": stints
+                        "strategy_type": strategy_type,
+                        "stints": stints,
+                        "driver_filter": driver_filter,
+                        "team_filter": team_filter
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver_filter": driver_filter, "team_filter": team_filter},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
@@ -720,9 +813,10 @@ class GetTireStrategyTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error="No tire strategy data found",
                     sql_query=query,
-                    sql_params={"session_key": session_key},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -732,12 +826,12 @@ class GetTireStrategyTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
-
+        
 class InvestigateIncidentTool(BaseMCPTool):
-    """Investigate incidents, slow laps, or unusual performance patterns"""
     category = "incident_analysis"
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -747,26 +841,116 @@ class InvestigateIncidentTool(BaseMCPTool):
             session_key = params.get("session_key")
             driver_name = params.get("driver_name")
             lap_number = params.get("lap_number")
-            investigation_type = params.get("investigation_type", "all")
-            context_laps = params.get("context_laps", 3)
+            target_drivers = params.get("target_drivers")  # List of specific drivers to look for
+            max_results = params.get("max_results", 15)
             
-            self.logger.info(f"Executing InvestigateIncidentTool for {driver_name} lap {lap_number}")
+            # Ensure lap_number is an integer
+            if lap_number is not None:
+                try:
+                    lap_number = int(lap_number)
+                except (ValueError, TypeError):
+                    lap_number = None
             
-            query = self.query_builder.build_incident_investigation_query(session_key, driver_name, lap_number, investigation_type, context_laps)
-            result = self.db_connection.execute_query(query)
+            # Ensure max_results is an integer
+            try:
+                max_results = int(max_results)
+            except (ValueError, TypeError):
+                max_results = 15
+            
+            self.logger.info(f"Executing InvestigateIncidentTool for {driver_name} lap {lap_number} drivers {target_drivers}")
+            
+            # Use the smart query with relevance scoring
+            query = self.query_builder.build_smart_incident_query(
+                session_key, driver_name, lap_number, target_drivers, max_results
+            )
+            
+            # Build query parameters
+            query_params = {
+                "session_key": session_key,
+                "max_results": max_results,
+                "target_lap": lap_number,
+                "driver_name": driver_name,
+                "target_drivers": target_drivers
+            }
+            
+            if lap_number:
+                query_params["lap_start"] = max(1, lap_number - 2)
+                query_params["lap_end"] = lap_number + 2
+            
+            if target_drivers:
+                for i, driver in enumerate(target_drivers):
+                    query_params[f"target_driver_{i}"] = driver
+            
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 incident_data = []
                 for row in result:
                     incident_data.append({
                         "lap": row[0],
-                        "lap_time": float(row[1]) if row[1] else None,
-                        "sector1": float(row[2]) if row[2] else None,
-                        "sector2": float(row[3]) if row[3] else None,
-                        "sector3": float(row[4]) if row[4] else None,
-                        "position": row[5],
-                        "incident": row[6] if len(row) > 6 else None
+                        "driver": row[1],
+                        "team": row[2],
+                        "lap_time": float(row[3]) if row[3] else None,
+                        "had_incident": row[4],
+                        "safety_car_lap": row[5],
+                        "is_outlier": row[6],
+                        "flag": row[7],
+                        "category": row[8],
+                        "message": row[9],
+                        "position": row[10],
+                        "created_at": str(row[11]) if row[11] else None,
+                        "relevance_score": row[12],
+                        "global_rank": row[13]
                     })
+                
+                # Check if we found the target lap/drivers
+                found_target_lap = lap_number and any(incident["lap"] == lap_number for incident in incident_data)
+                found_target_drivers = target_drivers and any(
+                    incident["driver"] in target_drivers for incident in incident_data
+                )
+                
+                # If we didn't find what we're looking for, try a broader search
+                if (lap_number and not found_target_lap) or (target_drivers and not found_target_drivers):
+                    self.logger.info("Target not found in first pass, trying broader search...")
+                    
+                    # Try multi-pass query
+                    broader_query = self.query_builder.build_multi_pass_incident_query(
+                        session_key, driver_name, lap_number, target_drivers
+                    )
+                    
+                    broader_params = {"session_key": session_key}
+                    if lap_number:
+                        broader_params["lap_start"] = max(1, lap_number - 2)
+                        broader_params["lap_end"] = lap_number + 2
+                    if target_drivers:
+                        for i, driver in enumerate(target_drivers):
+                            broader_params[f"target_driver_{i}"] = driver
+                    
+                    broader_result = self.db_connection.execute_mcp_query(broader_query, broader_params)
+                    
+                    if broader_result:
+                        # Add broader results (avoiding duplicates)
+                        existing_laps = {(incident["lap"], incident["driver"]) for incident in incident_data}
+                        
+                        for row in broader_result:
+                            lap_driver_key = (row[0], row[1])
+                            if lap_driver_key not in existing_laps:
+                                incident_data.append({
+                                    "lap": row[0],
+                                    "driver": row[1],
+                                    "team": row[2],
+                                    "lap_time": float(row[3]) if row[3] else None,
+                                    "had_incident": row[4],
+                                    "safety_car_lap": row[5],
+                                    "is_outlier": row[6],
+                                    "flag": row[7],
+                                    "category": row[8],
+                                    "message": row[9],
+                                    "position": row[10],
+                                    "created_at": str(row[11]) if row[11] else None,
+                                    "pass_type": row[12]
+                                })
+                                existing_laps.add(lap_driver_key)
                 
                 execution_time = time.time() - start_time
                 self.logger.info(f"InvestigateIncidentTool completed successfully in {execution_time:.3f}s")
@@ -776,23 +960,35 @@ class InvestigateIncidentTool(BaseMCPTool):
                     data={
                         "driver": driver_name,
                         "target_lap": lap_number,
-                        "investigation_type": investigation_type,
-                        "context_laps": context_laps,
-                        "lap_data": incident_data
+                        "target_drivers": target_drivers,
+                        "incident_data": incident_data,
+                        "total_incidents": len(incident_data),
+                        "found_target_lap": found_target_lap,
+                        "found_target_drivers": found_target_drivers,
+                        "summary": self._generate_smart_summary(incident_data, lap_number, target_drivers)
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver_name": driver_name, "lap_number": lap_number},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
                 execution_time = time.time() - start_time
-                self.logger.warning(f"InvestigateIncidentTool: No incident data found for {driver_name} lap {lap_number}")
+                self.logger.info(f"SmartIncidentAnalysisTool: No incidents found")
                 
                 return ToolResult(
-                    success=False,
-                    error=f"No incident data found for {driver_name} lap {lap_number}",
+                    success=True,
+                    data={
+                        "driver": driver_name,
+                        "target_lap": lap_number,
+                        "target_drivers": target_drivers,
+                        "incident_data": [],
+                        "total_incidents": 0,
+                        "found_target_lap": False,
+                        "found_target_drivers": False,
+                        "summary": "No significant incidents found in this session."
+                    },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver_name": driver_name, "lap_number": lap_number},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -802,9 +998,46 @@ class InvestigateIncidentTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
+    
+    def _generate_smart_summary(self, incident_data, lap_number, target_drivers):
+        """Generate a smart summary based on what was found"""
+        if not incident_data:
+            return "No significant incidents found."
+        
+        # Check for specific lap incidents
+        lap_incidents = [incident for incident in incident_data if incident["lap"] == lap_number] if lap_number else []
+        
+        # Check for target driver incidents
+        driver_incidents = []
+        if target_drivers:
+            driver_incidents = [incident for incident in incident_data if incident["driver"] in target_drivers]
+        
+        summary_parts = []
+        
+        if lap_incidents:
+            summary_parts.append(f"Found {len(lap_incidents)} incident(s) on lap {lap_number}")
+        
+        if driver_incidents:
+            driver_names = list(set(incident["driver"] for incident in driver_incidents))
+            summary_parts.append(f"Found {len(driver_incidents)} incident(s) involving {', '.join(driver_names)}")
+        
+        # Count by severity
+        crashes = sum(1 for incident in incident_data if incident.get("category") == "Crash" or incident.get("had_incident"))
+        red_flags = sum(1 for incident in incident_data if incident.get("flag") == "Red")
+        yellow_flags = sum(1 for incident in incident_data if incident.get("flag") == "Yellow")
+        
+        if crashes > 0:
+            summary_parts.append(f"{crashes} crash(es)")
+        if red_flags > 0:
+            summary_parts.append(f"{red_flags} red flag(s)")
+        if yellow_flags > 0:
+            summary_parts.append(f"{yellow_flags} yellow flag(s)")
+        
+        return f"Summary: {', '.join(summary_parts)}" if summary_parts else "Minor incidents only"
 
 class GetPositionProgressionTool(BaseMCPTool):
     """Get position changes throughout the session for drivers"""
@@ -822,7 +1055,7 @@ class GetPositionProgressionTool(BaseMCPTool):
             self.logger.info(f"Executing GetPositionProgressionTool for session {session_key}")
             
             query = self.query_builder.build_position_progression_query(session_key, driver_filter, team_filter, progression_type)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key})
             
             if result:
                 progression_data = []
@@ -854,6 +1087,7 @@ class GetPositionProgressionTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error="No position progression data found",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -866,6 +1100,7 @@ class GetPositionProgressionTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -886,21 +1121,80 @@ class GetSectorAnalysisTool(BaseMCPTool):
             self.logger.info(f"Executing GetSectorAnalysisTool for session {session_key}")
             
             query = self.query_builder.build_sector_analysis_query(session_key, driver_filter, team_filter, sector_analysis_type)
-            result = self.db_connection.execute_query(query)
+            
+            # Build query parameters
+            query_params = {"session_key": session_key}
+            if driver_filter:
+                query_params["driver_filter"] = driver_filter
+            if team_filter:
+                query_params["team_filter"] = team_filter
+            
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 sector_data = []
                 for row in result:
-                    sector_data.append({
-                        "driver": row[0],
-                        "team": row[1],
-                        "best_sector1": float(row[2]) if row[2] else None,
-                        "best_sector2": float(row[3]) if row[3] else None,
-                        "best_sector3": float(row[4]) if row[4] else None,
-                        "avg_sector1": float(row[5]) if row[5] else None,
-                        "avg_sector2": float(row[6]) if row[6] else None,
-                        "avg_sector3": float(row[7]) if row[7] else None
-                    })
+                    # Handle different result structures based on analysis type
+                    if sector_analysis_type == "best_sectors":
+                        sector_data.append({
+                            "driver": row[0],
+                            "team": row[1],
+                            "best_sector1": float(row[2]) if row[2] else None,
+                            "best_sector2": float(row[3]) if row[3] else None,
+                            "best_sector3": float(row[4]) if row[4] else None,
+                            "avg_sector1": float(row[5]) if row[5] else None,
+                            "avg_sector2": float(row[6]) if row[6] else None,
+                            "avg_sector3": float(row[7]) if row[7] else None,
+                            "total_laps": row[8],
+                            "sector1_consistency": float(row[9]) if row[9] else None,
+                            "sector2_consistency": float(row[10]) if row[10] else None,
+                            "sector3_consistency": float(row[11]) if row[11] else None
+                        })
+                    elif sector_analysis_type == "consistency":
+                        sector_data.append({
+                            "driver": row[0],
+                            "team": row[1],
+                            "avg_sector1": float(row[2]) if row[2] else None,
+                            "avg_sector2": float(row[3]) if row[3] else None,
+                            "avg_sector3": float(row[4]) if row[4] else None,
+                            "sector1_consistency": float(row[5]) if row[5] else None,
+                            "sector2_consistency": float(row[6]) if row[6] else None,
+                            "sector3_consistency": float(row[7]) if row[7] else None,
+                            "total_laps": row[8],
+                            "overall_consistency": float(row[9]) if row[9] else None
+                        })
+                    elif sector_analysis_type == "comparison":
+                        sector_data.append({
+                            "driver": row[0],
+                            "team": row[1],
+                            "best_sector1": float(row[2]) if row[2] else None,
+                            "best_sector2": float(row[3]) if row[3] else None,
+                            "best_sector3": float(row[4]) if row[4] else None,
+                            "avg_sector1": float(row[5]) if row[5] else None,
+                            "avg_sector2": float(row[6]) if row[6] else None,
+                            "avg_sector3": float(row[7]) if row[7] else None,
+                            "sector1_gap_to_best": float(row[8]) if row[8] else None,
+                            "sector2_gap_to_best": float(row[9]) if row[9] else None,
+                            "sector3_gap_to_best": float(row[10]) if row[10] else None,
+                            "total_laps": row[11]
+                        })
+                    else:  # "all" - comprehensive analysis
+                        sector_data.append({
+                            "driver": row[0],
+                            "team": row[1],
+                            "best_sector1": float(row[2]) if row[2] else None,
+                            "best_sector2": float(row[3]) if row[3] else None,
+                            "best_sector3": float(row[4]) if row[4] else None,
+                            "avg_sector1": float(row[5]) if row[5] else None,
+                            "avg_sector2": float(row[6]) if row[6] else None,
+                            "avg_sector3": float(row[7]) if row[7] else None,
+                            "total_laps": row[8],
+                            "sector1_consistency": float(row[9]) if row[9] else None,
+                            "sector2_consistency": float(row[10]) if row[10] else None,
+                            "sector3_consistency": float(row[11]) if row[11] else None,
+                            "strongest_sector": row[12],
+                            "weakest_sector": row[13]
+                        })
                 
                 execution_time = time.time() - start_time
                 self.logger.info(f"GetSectorAnalysisTool completed successfully in {execution_time:.3f}s")
@@ -909,10 +1203,11 @@ class GetSectorAnalysisTool(BaseMCPTool):
                     success=True,
                     data={
                         "sector_analysis_type": sector_analysis_type,
-                        "sector_data": sector_data
+                        "sector_data": sector_data,
+                        "total_drivers": len(sector_data)
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver_filter": driver_filter, "team_filter": team_filter},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
@@ -921,9 +1216,10 @@ class GetSectorAnalysisTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error="No sector analysis data found",
                     sql_query=query,
-                    sql_params={"session_key": session_key},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -933,6 +1229,7 @@ class GetSectorAnalysisTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -951,7 +1248,10 @@ class ExploreSchemaTool(BaseMCPTool):
             self.logger.info(f"Executing ExploreSchemaTool for table {table_name}, detail {detail_level}")
             
             query = self.query_builder.build_schema_exploration_query(table_name, detail_level)
-            result = self.db_connection.execute_query(query)
+            if table_name:
+                result = self.db_connection.execute_mcp_query(query, {"table_name": table_name})
+            else:
+                result = self.db_connection.execute_mcp_query(query)
             
             if result:
                 schema_data = []
@@ -984,6 +1284,7 @@ class ExploreSchemaTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error=f"No schema data found for table {table_name}",
                     sql_query=query,
                     sql_params={"table_name": table_name},
@@ -996,6 +1297,7 @@ class ExploreSchemaTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
@@ -1013,7 +1315,7 @@ class GetSessionInfoTool(BaseMCPTool):
             self.logger.info(f"Executing GetSessionInfoTool for session {session_key}")
             
             query = self.query_builder.build_session_info_query(session_key)
-            result = self.db_connection.execute_query(query)
+            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key})
             
             if result:
                 row = result[0]
@@ -1044,6 +1346,7 @@ class GetSessionInfoTool(BaseMCPTool):
                 
                 return ToolResult(
                     success=False,
+                    data={}, 
                     error=f"No session info found for session {session_key}",
                     sql_query=query,
                     sql_params={"session_key": session_key},
@@ -1056,26 +1359,7 @@ class GetSessionInfoTool(BaseMCPTool):
             
             return ToolResult(
                 success=False,
+                data={}, 
                 error=str(e),
                 execution_time=execution_time
             )
-
-# # Tool registry for easy access
-# MCP_TOOLS = {
-#     "get_meeting_key": GetMeetingKeyTool,
-#     "get_session_key": GetSessionKeyTool,
-#     "get_fastest_lap": GetFastestLapTool,
-#     "get_driver_performance": GetDriverPerformanceTool,
-#     "get_team_performance": GetTeamPerformanceTool,
-#     "compare_drivers": CompareDriversTool,
-#     "compare_teams": CompareTeamsTool,
-#     "get_race_results": GetRaceResultsTool,
-#     "get_qualifying_results": GetQualifyingResultsTool,
-#     "get_pit_stop_analysis": GetPitStopAnalysisTool,
-#     "get_tire_strategy": GetTireStrategyTool,
-#     "investigate_incident": InvestigateIncidentTool,
-#     "get_position_progression": GetPositionProgressionTool,
-#     "get_sector_analysis": GetSectorAnalysisTool,
-#     "explore_schema": ExploreSchemaTool,
-#     "get_session_info": GetSessionInfoTool
-# }
