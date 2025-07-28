@@ -9,6 +9,7 @@
     <style>
         :root {
             --f1-red: #e10600;
+            --f1-primary: #e10600;
             --f1-dark: #1a1a1a;
             --f1-gray: #2a2a2a;
             --f1-light-gray: #3a3a3a;
@@ -147,6 +148,68 @@
             color: var(--f1-white);
             border-bottom-left-radius: 8px;
             border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        /* Visualization Container */
+        .visualization-container {
+            margin-top: 1rem;
+            background: var(--f1-dark);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .visualization-header {
+            background: var(--f1-light-gray);
+            padding: 0.75rem 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .visualization-title {
+            font-weight: 600;
+            color: var(--f1-white);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .visualization-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .viz-action-btn {
+            background: var(--f1-primary);
+            border: none;
+            border-radius: 6px;
+            padding: 0.25rem 0.5rem;
+            color: var(--f1-white);
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .viz-action-btn:hover {
+            background: var(--f1-accent);
+        }
+
+        .visualization-frame {
+            width: 100%;
+            height: 500px;
+            border: none;
+            background: var(--f1-dark);
+        }
+
+        .visualization-loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--f1-white);
+            font-style: italic;
         }
 
         .typing-indicator {
@@ -290,6 +353,10 @@
             .input-container {
                 padding: 1rem;
             }
+            
+            .visualization-frame {
+                height: 300px;
+            }
         }
 
         /* Scrollbar Styling */
@@ -338,6 +405,8 @@
                             <p>• "Compare Max Verstappen and Lewis Hamilton"</p>
                             <p>• "What's the fastest lap in Monaco?"</p>
                             <p>• "Show me the pit stop analysis for Bahrain"</p>
+                            <p>• "Visualize the lap time progression for Australian GP"</p>
+                            <p>• "Create a graph showing position changes"</p>
                         </div>
                     </div>
                 </div>
@@ -358,7 +427,7 @@
                     <textarea 
                         id="chat-input" 
                         class="chat-input" 
-                        placeholder="Ask about F1 racing..."
+                        placeholder="Ask about F1 racing or request visualizations..."
                         rows="1"
                     ></textarea>
                     <button id="send-button" class="send-button">
@@ -377,8 +446,9 @@
                 this.sendButton = document.getElementById('send-button');
                 this.typingIndicator = document.getElementById('typing-indicator');
                 this.statusText = document.getElementById('status-text');
-                
                 this.isProcessing = false;
+                
+                // Initialize the chatbot
                 this.init();
             }
 
@@ -436,7 +506,6 @@
                 // Add user message
                 this.addMessage(message, 'user');
                 this.chatInput.value = '';
-                this.autoResizeTextarea();
 
                 // Show typing indicator
                 this.showTypingIndicator();
@@ -447,7 +516,7 @@
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({ message })
+                        body: JSON.stringify({ message: message })
                     });
 
                     const data = await response.json();
@@ -456,6 +525,11 @@
                         this.addMessage(`❌ ${data.error}`, 'bot');
                     } else {
                         this.addMessage(data.response, 'bot');
+                        
+                        // Handle visualization if present
+                        if (data.visualization) {
+                            this.displayVisualization(data.visualization);
+                        }
                     }
                 } catch (error) {
                     this.addMessage('❌ Sorry, I encountered an error. Please try again.', 'bot');
@@ -466,6 +540,39 @@
                     this.chatInput.disabled = false;
                     this.chatInput.focus();
                 }
+            }
+
+            displayVisualization(vizData) {
+                const vizContainer = document.createElement('div');
+                vizContainer.className = 'visualization-container';
+                
+                // Add debugging
+                console.log('Visualization data:', vizData);
+                console.log('Filename:', vizData.filename);
+                
+                vizContainer.innerHTML = `
+                    <div class="visualization-header">
+                        <div class="visualization-title">
+                            <i class="fas fa-chart-line"></i>
+                            <span>F1 Data Visualization</span>
+                        </div>
+                        <div class="visualization-actions">
+                            <button class="viz-action-btn" onclick="this.parentElement.parentElement.parentElement.remove()">
+                                <i class="fas fa-times"></i> Close
+                            </button>
+                        </div>
+                    </div>
+                    <iframe 
+                        src="/api/visualization/${vizData.filename}" 
+                        class="visualization-frame"
+                        title="F1 Data Visualization"
+                        onload="console.log('Iframe loaded successfully')"
+                        onerror="console.error('Iframe failed to load')">
+                    </iframe>
+                `;
+                
+                this.chatMessages.appendChild(vizContainer);
+                this.scrollToBottom();
             }
 
             addMessage(content, sender) {

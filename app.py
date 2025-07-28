@@ -1,11 +1,13 @@
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import json
 import asyncio
 from typing import Dict, Any
 import logging
+from pathlib import Path
 
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -20,8 +22,15 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Only mount templates - no static files needed
+# Mount templates and static files
 templates = Jinja2Templates(directory="templates")
+
+# Create artifacts directory for visualizations
+artifacts_dir = Path("artifacts")
+artifacts_dir.mkdir(exist_ok=True)
+
+# Mount static files for serving visualizations
+app.mount("/artifacts", StaticFiles(directory="artifacts"), name="artifacts")
 
 # Initialize MCP pipeline
 mcp_pipeline = None
@@ -70,14 +79,42 @@ async def chat_endpoint(request: Request):
         # Get response from reasoning engine
         response = mcp_pipeline.test_reasoning_engine(user_message)
         
+        # Check if response contains visualization data
+        visualization_data = None
+        if hasattr(mcp_pipeline, 'last_visualization') and mcp_pipeline.last_visualization:
+            visualization_data = mcp_pipeline.last_visualization
+            mcp_pipeline.last_visualization = None  # Clear after sending
+        
         return {
             "response": response,
+            "visualization": visualization_data,
             "timestamp": asyncio.get_event_loop().time()
         }
         
     except Exception as e:
         logging.error(f"Error processing chat request: {e}")
         return {"error": "Sorry, I encountered an error. Please try again."}
+
+@app.get("/api/visualization/{filename}")
+async def get_visualization(filename: str):
+    """Serve visualization files"""
+    try:
+        viz_path = Path("artifacts/visualizations") / filename
+        if viz_path.exists():
+            return FileResponse(
+                path=str(viz_path),
+                media_type="text/html",
+                # Remove filename parameter to prevent download
+                headers={
+                    "Content-Disposition": "inline",  # Display in browser, don't download
+                    "X-Frame-Options": "SAMEORIGIN"  # Allow iframe embedding
+                }
+            )
+        else:
+            return {"error": "Visualization not found"}
+    except Exception as e:
+        logging.error(f"Error serving visualization {filename}: {e}")
+        return {"error": "Error serving visualization"}
 
 @app.get("/api/health")
 async def health_check():

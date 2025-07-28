@@ -1,7 +1,7 @@
 class QueryBuilder:
     """Class to build SQL queries for MCP tools with parameterized placeholders"""
 
-    def build_meeting_query(self, event_name, year):
+    def build_meeting_query(self, event_name, year): ## find by name
         """Build query to get meeting key for a specific event"""
         return """
         SELECT meeting_key, meeting_name, country_name, date_start, year
@@ -11,6 +11,16 @@ class QueryBuilder:
         ORDER BY date_start DESC
         LIMIT 1
         """
+    
+    def build_meeting_info_query(self, session_key: str):
+        """Build query to get meeting information for a session"""
+        query = """
+            SELECT m.meeting_name, m.country_name, m.year, s.session_name
+            FROM meetings m
+            JOIN sessions_transformed s ON m.meeting_key = s.meeting_key
+            WHERE s.session_key = :session_key
+        """
+        return query
 
     def build_session_query(self, meeting_key, session_type):
         """Build query to get session key for a specific session type with enhanced logic"""
@@ -222,76 +232,42 @@ class QueryBuilder:
             ORDER BY p.position ASC
             """ + limit_clause
 
-    def build_pit_stop_analysis_query(self, session_key, driver_filter=None, team_filter=None, analysis_type="all"):
-        """Build query to analyze pit stop strategy and performance"""
-        where_conditions = ["ps.session_key = :session_key"]
+    def build_pit_stop_analysis_query(self, session_key: str, driver_filter: str = None, team_filter: str = None, analysis_type: str = "all"):
+        """Build query to get pit stop analysis data"""
+        where_conditions = ["p.session_key = :session_key"]
         params = {"session_key": session_key}
         
         if driver_filter:
-            where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
-            params["driver_filter"] = driver_filter
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
         if team_filter:
-            where_conditions.append("UPPER(d.team_name) = UPPER(:team_filter)")
-            params["team_filter"] = team_filter
-        
-        where_clause = " AND ".join(where_conditions)
-
-        if analysis_type == "summary":
-            # ✅ Summary statistics with correct schema
-            return """
-            SELECT 
-                d.full_name,
-                d.team_name,
-                COUNT(*) AS total_stops,
-                ROUND(AVG(ps.pit_duration)::numeric, 6) AS avg_pit_time,
-                MIN(ps.pit_duration) AS fastest_stop,
-                MAX(ps.pit_duration) AS slowest_stop,
-                MIN(ps.lap_number) AS first_stop,
-                MAX(ps.lap_number) AS last_stop,
-                COUNT(CASE WHEN ps.long_pit_stop = true THEN 1 END) AS long_stops,
-                COUNT(CASE WHEN ps.normal_pit_stop = true THEN 1 END) AS normal_stops,
-                COUNT(CASE WHEN ps.penalty_pit_stop = true THEN 1 END) AS penalty_stops
-            FROM pit_stops_transformed ps
-            JOIN drivers_transformed d ON ps.driver_number = d.driver_number 
-                AND ps.meeting_key = d.meeting_key
-                AND ps.session_key = d.session_key
-            WHERE """ + where_clause + """
-            GROUP BY d.full_name, d.team_name
-            ORDER BY avg_pit_time ASC
-            """
-        else:
-            # ✅ Individual pit stop details with correct schema
-            return """
-            SELECT 
-                d.full_name,
-                d.team_name,
-                ps.lap_number,
-                ps.pit_duration,                    -- Full precision, no rounding
-                ps.normal_pit_stop,
-                ps.long_pit_stop,
-                ps.penalty_pit_stop,
-                ps.is_outlier,
-                ps.created_at
-            FROM pit_stops_transformed ps
-            JOIN drivers_transformed d ON ps.driver_number = d.driver_number 
-                AND ps.meeting_key = d.meeting_key
-                AND ps.session_key = d.session_key
-            WHERE """ + where_clause + """
-            ORDER BY ps.pit_duration ASC, d.full_name, ps.lap_number
-            """
-    
-    def build_tire_strategy_query(self, session_key, driver_filter=None, team_filter=None, strategy_type="all"):
-        """Build query to analyze tire strategy and stint information"""
-        
-        where_conditions = ["s.session_key = :session_key"]
-        params = {"session_key": session_key}
-        
-        if driver_filter:
-            where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
-            params["driver_filter"] = driver_filter
-        if team_filter:
-            where_conditions.append("d.team_name ILIKE :team_filter_pattern")
-            params["team_filter_pattern"] = f"%{team_filter}%"
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
         
         where_clause = " AND ".join(where_conditions)
         
@@ -299,28 +275,20 @@ class QueryBuilder:
         SELECT 
             d.full_name,
             d.team_name,
-            ROW_NUMBER() OVER (PARTITION BY d.driver_number ORDER BY s.lap_start) AS stint_number,
-            s.lap_start AS start_lap,
-            s.lap_end AS end_lap,
-            s.compound AS tire_compound,
-            (s.lap_end - s.lap_start + 1) AS stint_length,
-            ROUND(AVG(l.lap_duration)::numeric, 3) AS avg_lap_time
-        FROM stints_transformed s
-        JOIN drivers_transformed d 
-            ON s.driver_number = d.driver_number 
-            AND s.meeting_key = d.meeting_key 
-            AND s.session_key = d.session_key
-        LEFT JOIN laps_transformed l 
-            ON s.driver_number = l.driver_number 
-            AND s.meeting_key = l.meeting_key 
-            AND s.session_key = l.session_key
-            AND l.lap_number BETWEEN s.lap_start AND s.lap_end
-            AND l.lap_duration IS NOT NULL
-            AND l.lap_duration > 0
-            AND COALESCE(l.is_outlier, false) = false
+            p.lap_number,
+            p.pit_duration,
+            p.pit_stop_count,
+            p.pit_stop_timing,
+            p.normal_pit_stop,
+            p.long_pit_stop,
+            p.penalty_pit_stop
+        FROM pit_stops_transformed p
+        JOIN drivers_transformed d ON p.driver_number = d.driver_number 
+            AND p.session_key = d.session_key
         WHERE {where_clause}
-        GROUP BY d.driver_number, d.full_name, d.team_name, s.lap_start, s.lap_end, s.compound
-        ORDER BY d.full_name, s.lap_start
+            AND p.pit_duration IS NOT NULL
+            AND p.pit_duration > 0
+        ORDER BY p.lap_number, d.full_name
         """
 
     
@@ -937,22 +905,83 @@ class QueryBuilder:
             sector_analysis_type: "all", "best_sectors", "consistency", "comparison"
         """
         
+        # # Build filter conditions
+        # where_conditions = ["l.session_key = :session_key"]
+        # params = {"session_key": session_key}
+        
+        # if driver_filter:
+        #     where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+        #     params["driver_filter"] = driver_filter
+        
+        # if team_filter:
+        #     where_conditions.append("UPPER(d.team_name) = UPPER(:team_filter)")
+        #     params["team_filter"] = team_filter
+        
+        # where_clause = " AND ".join(where_conditions)
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 build_sector_analysis_query - session_key: {session_key}, driver_filter: {driver_filter}, team_filter: {team_filter}, sector_analysis_type: {sector_analysis_type}")
+
         # Build filter conditions
         where_conditions = ["l.session_key = :session_key"]
         params = {"session_key": session_key}
         
         if driver_filter:
-            where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
-            params["driver_filter"] = driver_filter
+            # Handle comma-separated driver names
+            driver_names = [name.strip() for name in driver_filter.split(',')]
+            if len(driver_names) == 1:
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_names[0]
+            else:
+                placeholders = [f":driver_{i}" for i in range(len(driver_names))]
+                where_conditions.append(f"UPPER(d.full_name) IN ({', '.join(placeholders)})")
+                for i, name in enumerate(driver_names):
+                    params[f"driver_{i}"] = name.upper()
         
         if team_filter:
-            where_conditions.append("UPPER(d.team_name) = UPPER(:team_filter)")
-            params["team_filter"] = team_filter
+            # Handle comma-separated team names
+            team_names = [name.strip() for name in team_filter.split(',')]
+            if len(team_names) == 1:
+                where_conditions.append("UPPER(d.team_name) = UPPER(:team_filter)")
+                params["team_filter"] = team_names[0]
+            else:
+                placeholders = [f":team_{i}" for i in range(len(team_names))]
+                where_conditions.append(f"UPPER(d.team_name) IN ({', '.join(placeholders)})")
+                for i, name in enumerate(team_names):
+                    params[f"team_{i}"] = name.upper()
         
         where_clause = " AND ".join(where_conditions)
+
+        logger.info(f"�� Final where_clause: {where_clause}")
+        logger.info(f"🔍 Final params: {params}")
         
         # Different query types based on analysis type
-        if sector_analysis_type == "best_sectors":
+        if sector_analysis_type == "all":
+            # Return raw lap-by-lap data for visualization
+            return f"""
+            SELECT 
+                d.full_name,
+                d.team_name,
+                l.duration_sector_1,
+                l.duration_sector_2,
+                l.duration_sector_3,
+                l.lap_duration,
+                l.lap_number
+            FROM laps_transformed l
+            JOIN drivers_transformed d ON l.driver_number = d.driver_number 
+                AND l.session_key = d.session_key
+            WHERE {where_clause}
+                AND l.duration_sector_1 IS NOT NULL
+                AND l.duration_sector_2 IS NOT NULL
+                AND l.duration_sector_3 IS NOT NULL
+                AND l.duration_sector_1 > 0
+                AND l.duration_sector_2 > 0
+                AND l.duration_sector_3 > 0
+                AND COALESCE(l.is_outlier, false) = false
+            ORDER BY d.full_name, l.lap_number
+            """
+        elif sector_analysis_type == "best_sectors":
             return f"""
             SELECT 
                 d.full_name,
@@ -1150,4 +1179,339 @@ class QueryBuilder:
         FROM sessions_transformed s
         JOIN meetings m ON s.meeting_key = m.meeting_key
         WHERE s.session_key = :session_key
+        """
+    
+    def build_lap_time_progression_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """Build query to get lap time progression data for visualization"""
+        where_conditions = ["l.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
+        if team_filter:
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        return f"""
+        SELECT 
+            l.lap_number,
+            d.full_name,
+            d.team_name,
+            l.lap_duration,
+            l.duration_sector_1,
+            l.duration_sector_2,
+            l.duration_sector_3,
+            l.had_incident,
+            l.safety_car_lap
+        FROM laps_transformed l
+        JOIN drivers_transformed d ON l.driver_number = d.driver_number 
+            AND l.session_key = d.session_key
+        WHERE {where_clause}
+            AND l.lap_duration IS NOT NULL
+            AND l.lap_duration > 0
+            AND COALESCE(l.is_outlier, false) = false
+        ORDER BY l.lap_number, d.full_name
+        """
+
+    def build_tire_strategy_viz_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """Build query to get tire strategy data for visualization"""
+        where_conditions = ["st.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
+        if team_filter:
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        return f"""
+        SELECT 
+            d.full_name,
+            d.team_name,
+            st.compound,
+            st.lap_start,
+            st.lap_end,
+            (st.lap_end - st.lap_start + 1) as stint_length
+        FROM stints_transformed st
+        JOIN drivers_transformed d ON st.driver_number = d.driver_number 
+            AND st.session_key = d.session_key
+        WHERE {where_clause}
+            AND st.lap_start IS NOT NULL
+            AND st.lap_end IS NOT NULL
+            AND st.compound IS NOT NULL
+        ORDER BY d.full_name, st.lap_start
+        """
+    
+    def build_position_progression_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """Build query to get position progression data directly from positions_transformed"""
+        
+        # Build filter conditions
+        driver_conditions = []
+        team_conditions = []
+        
+        if driver_filter:
+            # Handle comma-separated driver names
+            driver_names = [name.strip() for name in driver_filter.split(',')]
+            for i, driver in enumerate(driver_names):
+                param_name = f"driver_filter_{i}"
+                driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+        
+        if team_filter:
+            # Handle comma-separated team names
+            team_names = [name.strip() for name in team_filter.split(',')]
+            for i, team in enumerate(team_names):
+                param_name = f"team_filter_{i}"
+                team_conditions.append(f"d.team_name = :{param_name}")
+        
+        # Build the filter clauses
+        driver_clause = f"AND ({' OR '.join(driver_conditions)})" if driver_conditions else ""
+        team_clause = f"AND ({' OR '.join(team_conditions)})" if team_conditions else ""
+        
+        return f"""
+        SELECT 
+            p.date,
+            p.driver_number,
+            d.full_name AS driver_name,
+            d.team_name,
+            p.position,
+            p.position_change,
+            p.is_leader,
+            -- Calculate lap number based on time progression
+            ROW_NUMBER() OVER (
+                PARTITION BY p.driver_number 
+                ORDER BY p.date ASC
+            ) AS position_sequence
+        FROM positions_transformed p
+        JOIN drivers_transformed d 
+            ON p.driver_number = d.driver_number 
+            AND p.session_key = d.session_key
+        WHERE p.session_key = :session_key
+        AND p.position IS NOT NULL
+        AND p.date IS NOT NULL
+        {driver_clause}
+        {team_clause}
+        ORDER BY p.date ASC, p.position ASC
+        """
+
+    def build_tire_strategy_viz_query(self, session_key: str, driver_filter: str = None, team_filter: str = None, strategy_type: str = "all", viz_type: str = "gantt"):
+        """Build query to get tire strategy data for visualization"""
+        
+        # Build filter conditions
+        where_conditions = ["s.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Handle comma-separated driver names
+            driver_names = [name.strip() for name in driver_filter.split(',')]
+            if len(driver_names) == 1:
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_names[0]
+            else:
+                placeholders = [f":driver_{i}" for i in range(len(driver_names))]
+                where_conditions.append(f"UPPER(d.full_name) IN ({', '.join(placeholders)})")
+                for i, name in enumerate(driver_names):
+                    params[f"driver_{i}"] = name.upper()
+        
+        if team_filter:
+            # Handle comma-separated team names
+            team_names = [name.strip() for name in team_filter.split(',')]
+            if len(team_names) == 1:
+                where_conditions.append("UPPER(d.team_name) = UPPER(:team_filter)")
+                params["team_filter"] = team_names[0]
+            else:
+                placeholders = [f":team_{i}" for i in range(len(team_names))]
+                where_conditions.append(f"UPPER(d.team_name) IN ({', '.join(placeholders)})")
+                for i, name in enumerate(team_names):
+                    params[f"team_{i}"] = name.upper()
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        # Simple query for visualization
+        return f"""
+        SELECT 
+            d.full_name,
+            d.team_name,
+            s.lap_start,
+            s.lap_end,
+            s.compound,
+            (s.lap_end - s.lap_start + 1) as stint_length
+        FROM stints_transformed s
+        JOIN drivers_transformed d ON s.driver_number = d.driver_number 
+            AND s.session_key = d.session_key
+        WHERE {where_clause}
+        ORDER BY d.full_name, s.lap_start
+        """
+
+    def build_sector_analysis_viz_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """Build query to get sector analysis data for visualization"""
+        where_conditions = ["l.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
+        if team_filter:
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        return f"""
+        SELECT 
+            d.full_name,
+            d.team_name,
+            l.duration_sector_1,
+            l.duration_sector_2,
+            l.duration_sector_3,
+            l.lap_duration,
+            l.lap_number
+        FROM laps_transformed l
+        JOIN drivers_transformed d ON l.driver_number = d.driver_number 
+            AND l.session_key = d.session_key
+        WHERE {where_clause}
+            AND l.lap_duration IS NOT NULL
+            AND l.lap_duration > 0
+            AND COALESCE(l.is_outlier, false) = false
+            AND l.duration_sector_1 IS NOT NULL
+            AND l.duration_sector_2 IS NOT NULL
+            AND l.duration_sector_3 IS NOT NULL
+        ORDER BY l.lap_number, d.full_name
+        """
+
+    def build_tire_strategy_viz_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """Build query to get tire strategy data for visualization"""
+        where_conditions = ["st.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
+        if team_filter:
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        return f"""
+        SELECT 
+            d.full_name,
+            d.team_name,
+            st.compound,
+            st.lap_start,
+            st.lap_end,
+            (st.lap_end - st.lap_start + 1) as stint_length
+        FROM stints_transformed st
+        JOIN drivers_transformed d ON st.driver_number = d.driver_number 
+            AND st.session_key = d.session_key
+        WHERE {where_clause}
+            AND st.lap_start IS NOT NULL
+            AND st.lap_end IS NOT NULL
+            AND st.compound IS NOT NULL
+        ORDER BY d.full_name, st.lap_start
         """

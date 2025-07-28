@@ -6,6 +6,10 @@ from src.formula_one.components.mcp_tools import (
     GetQualifyingResultsTool, GetPitStopAnalysisTool, GetTireStrategyTool, InvestigateIncidentTool, GetPositionProgressionTool, GetSectorAnalysisTool,
     GetSessionInfoTool, ExploreSchemaTool, GetFastestLapTool
 )
+from src.formula_one.components.mcp_visualization_tools import (
+    CreateLapTimeProgressionTool, CreatePositionProgressionTool, 
+    CreateSectorAnalysisTool, CreatePitStopAnalysisTool, CreateTireStrategyTool
+)
 from src.formula_one.components.mcp_server import FastAPIServer
 from src.formula_one.components.mcp_client import HTTPMCPClient
 from src.formula_one.components.mcp_reasoning import ReasoningEngine
@@ -56,7 +60,12 @@ class MCPTrainingPipeline:
             "get_position_progression": GetPositionProgressionTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "get_sector_analysis": GetSectorAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "explore_schema": ExploreSchemaTool(self.config, self.db_config, self.db_utils, self.query_builder),
-            "get_session_info": GetSessionInfoTool(self.config, self.db_config, self.db_utils, self.query_builder)
+            "get_session_info": GetSessionInfoTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "create_lap_time_progression": CreateLapTimeProgressionTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "create_position_progression": CreatePositionProgressionTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "create_sector_analysis": CreateSectorAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "create_pit_stop_analysis": CreatePitStopAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "create_tire_strategy": CreateTireStrategyTool(self.config, self.db_config, self.db_utils, self.query_builder)
         }
         
         # Initialize server
@@ -97,13 +106,6 @@ class MCPTrainingPipeline:
             
             self.logger.info("MCP system initialized successfully. Starting interactive test mode...")
             print(f"F1 Bot is ready! Enter a query (or 'exit' to quit) at {time.strftime('%H:%M:%S %Z on %Y-%m-%d', time.localtime())}:")
-            # while True:
-            #     query = input("> ").strip()
-            #     if query.lower() == "exit":
-            #         break
-            #     if query:
-            #         response = self.test_reasoning_engine(query)
-            #         print(f"Response: {response}\n")
             
             while self.running:
                 query = input("> ").strip()
@@ -123,9 +125,25 @@ class MCPTrainingPipeline:
         self.logger.info("Starting MCP server...")
         self.server.run_server_in_thread()
     
-    def test_reasoning_engine(self, query: str):
-        """Test the reasoning engine with a query"""
-        #self.logger.info(f"Testing reasoning engine with query: {query}")
-        response = self.reasoning_engine.reason_and_answer(query)
-        #self.logger.info(f"Reasoning engine response: {response}")
-        return response
+    def test_reasoning_engine(self, user_query: str) -> str:
+        """Test the reasoning engine with a user query"""
+        try:
+            # Clear any previous visualization data
+            self.last_visualization = None
+            
+            # Get response from reasoning engine
+            result = self.reasoning_engine.reason_and_answer(user_query)
+            
+            # Handle the response (it might be a tuple now)
+            if isinstance(result, tuple):
+                response, visualization_data = result
+                if visualization_data and visualization_data.get("success"):
+                    self.last_visualization = visualization_data
+                return response
+            else:
+                # Backward compatibility for when reason_and_answer returns just a string
+                return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in test_reasoning_engine: {e}")
+            return f"I apologize, but I encountered an error: {str(e)}"
