@@ -135,6 +135,7 @@
             font-size: 0.95rem;
             line-height: 1.5;
             word-wrap: break-word;
+            white-space: pre-wrap; /* Preserve line breaks */
         }
 
         .message.user .message-content {
@@ -150,6 +151,44 @@
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
 
+        /* Add formatting styles for bot messages */
+        .message.bot .message-content h1,
+        .message.bot .message-content h2,
+        .message.bot .message-content h3 {
+            color: var(--f1-white);
+            margin: 0.5rem 0;
+        }
+
+        .message.bot .message-content p {
+            margin: 0.5rem 0;
+        }
+
+        .message.bot .message-content ul,
+        .message.bot .message-content ol {
+            margin: 0.5rem 0;
+            padding-left: 1.5rem;
+        }
+
+        .message.bot .message-content li {
+            margin: 0.25rem 0;
+        }
+
+        .message.bot .message-content strong {
+            color: var(--f1-accent);
+            font-weight: 600;
+        }
+
+        .message.bot .message-content em {
+            color: var(--f1-success);
+            font-style: italic;
+        }
+
+        .message.bot .message-content code {
+            background: var(--f1-dark);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
         /* Visualization Container */
         .visualization-container {
             margin-top: 1rem;
@@ -575,13 +614,39 @@
                 this.scrollToBottom();
             }
 
+            // addMessage(content, sender) {
+            //     const messageDiv = document.createElement('div');
+            //     messageDiv.className = `message ${sender}`;
+                
+            //     const contentDiv = document.createElement('div');
+            //     contentDiv.className = 'message-content';
+            //     contentDiv.textContent = content;
+                
+            //     messageDiv.appendChild(contentDiv);
+            //     this.chatMessages.appendChild(messageDiv);
+                
+            //     this.scrollToBottom();
+            // }
             addMessage(content, sender) {
                 const messageDiv = document.createElement('div');
                 messageDiv.className = `message ${sender}`;
                 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-content';
-                contentDiv.textContent = content;
+                
+                if (sender === 'bot') {
+                    // Convert markdown-style formatting to HTML
+                    let formattedContent = content
+                        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')  // **bold** to <strong>
+                        .replace(/\*(.*?)\*/g, '<em>$1</em>')              // *italic* to <em>
+                        .replace(/`(.*?)`/g, '<code>$1</code>')            // `code` to <code>
+                        .replace(/\n/g, '<br>');                           // \n to <br>
+                    
+                    contentDiv.innerHTML = formattedContent;
+                } else {
+                    // Use textContent for user messages (security)
+                    contentDiv.textContent = content;
+                }
                 
                 messageDiv.appendChild(contentDiv);
                 this.chatMessages.appendChild(messageDiv);

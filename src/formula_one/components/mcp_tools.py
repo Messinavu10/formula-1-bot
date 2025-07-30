@@ -268,13 +268,16 @@ class GetDriverPerformanceTool(BaseMCPTool):
                     performance_data.append({
                         "driver": row[0],
                         "team": row[1],
-                        "total_laps": row[2],
-                        "avg_lap": float(row[3]) if row[3] else None,
-                        "best_lap": float(row[4]) if row[4] else None,
-                        "worst_lap": float(row[5]) if row[5] else None,
-                        "consistency": float(row[6]) if row[6] else None,
-                        "position": row[7],
-                        "incidents": row[8]
+                        "session_name": row[2],
+                        "total_laps": row[3],
+                        "avg_lap": float(row[4]) if row[4] else None,
+                        "best_lap": float(row[5]) if row[5] else None,
+                        "worst_lap": float(row[6]) if row[6] else None, 
+                        "consistency": float(row[7]) if row[7] else None,
+                        "incidents": row[8],
+                        "avg_sector_1": float(row[9]) if row[9] else None,
+                        "avg_sector_2": float(row[10]) if row[10] else None,
+                        "avg_sector_3": float(row[11]) if row[11] else None
                     })
                 
                 execution_time = time.time() - start_time
@@ -774,7 +777,7 @@ class GetTireStrategyTool(BaseMCPTool):
             if driver_filter:
                 query_params["driver_filter"] = driver_filter
             if team_filter:
-                query_params["team_filter_pattern"] = f"%{team_filter}%"
+                query_params["team_filter"] = team_filter  # Changed from team_filter_pattern
 
             result = self.db_connection.execute_mcp_query(query, query_params)
             
@@ -784,12 +787,12 @@ class GetTireStrategyTool(BaseMCPTool):
                     stints.append({
                         "driver": row[0],                    # full_name
                         "team": row[1],                      # team_name
-                        "stint_number": row[2],              # stint_number
-                        "start_lap": row[3],                 # start_lap
-                        "end_lap": row[4],                   # end_lap
-                        "tire_compound": row[5],             # tire_compound
-                        "stint_length": row[6],              # stint_length
-                        "avg_lap_time": float(row[7]) if row[7] else None  # avg_lap_time
+                        "compound": row[2],                  # compound (not stint_number)
+                        "start_lap": row[3],                 # lap_start
+                        "end_lap": row[4],                   # lap_end
+                        "tire_compound": row[2],             # compound (same as above)
+                        "stint_length": row[5],              # stint_length
+                        "avg_lap_time": float(row[6]) if row[6] else None  # avg_lap_time
                     })
                 
                 execution_time = time.time() - start_time
@@ -1038,7 +1041,7 @@ class InvestigateIncidentTool(BaseMCPTool):
             summary_parts.append(f"{yellow_flags} yellow flag(s)")
         
         return f"Summary: {', '.join(summary_parts)}" if summary_parts else "Minor incidents only"
-
+  
 class GetPositionProgressionTool(BaseMCPTool):
     """Get position changes throughout the session for drivers"""
     category = "position_analysis"
@@ -1055,17 +1058,36 @@ class GetPositionProgressionTool(BaseMCPTool):
             self.logger.info(f"Executing GetPositionProgressionTool for session {session_key}")
             
             query = self.query_builder.build_position_progression_query(session_key, driver_filter, team_filter, progression_type)
-            result = self.db_connection.execute_mcp_query(query, {"session_key": session_key})
+            
+            # Build parameters for the query
+            query_params = {"session_key": session_key}
+            
+            if driver_filter:
+                # Handle comma-separated driver names
+                driver_names = [name.strip() for name in driver_filter.split(',')]
+                for i, driver in enumerate(driver_names):
+                    query_params[f"driver_filter_{i}"] = driver
+            
+            if team_filter:
+                # Handle comma-separated team names
+                team_names = [name.strip() for name in team_filter.split(',')]
+                for i, team in enumerate(team_names):
+                    query_params[f"team_filter_{i}"] = team
+
+            result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 progression_data = []
                 for row in result:
                     progression_data.append({
-                        "driver": row[0],
-                        "team": row[1],
-                        "lap": row[2],
-                        "position": row[3],
-                        "position_change": row[4] if len(row) > 4 else None
+                        "date": row[0],
+                        "driver_number": row[1],
+                        "driver_name": row[2],
+                        "team_name": row[3],
+                        "position": row[4],
+                        "position_change": row[5],
+                        "is_leader": row[6],
+                        "position_sequence": row[7]
                     })
                 
                 execution_time = time.time() - start_time
@@ -1075,10 +1097,12 @@ class GetPositionProgressionTool(BaseMCPTool):
                     success=True,
                     data={
                         "progression_type": progression_type,
-                        "progression": progression_data
+                        "progression_data": progression_data,
+                        "driver_filter": driver_filter,
+                        "team_filter": team_filter
                     },
                     sql_query=query,
-                    sql_params={"session_key": session_key, "driver_filter": driver_filter, "team_filter": team_filter},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
             else:
@@ -1090,7 +1114,7 @@ class GetPositionProgressionTool(BaseMCPTool):
                     data={}, 
                     error="No position progression data found",
                     sql_query=query,
-                    sql_params={"session_key": session_key},
+                    sql_params=query_params,
                     execution_time=execution_time
                 )
                 
@@ -1104,6 +1128,87 @@ class GetPositionProgressionTool(BaseMCPTool):
                 error=str(e),
                 execution_time=execution_time
             )
+
+    def _summarize_position_progression(self, result, driver_filter=None, team_filter=None):
+            """Summarize position progression data to extract key insights"""
+            try:
+                # Convert to DataFrame for easier analysis
+                import pandas as pd
+                
+                df = pd.DataFrame(result, columns=[
+                    'timestamp', 'driver_number', 'driver_name', 'team_name', 
+                    'position', 'position_change', 'is_leader', 'position_sequence'
+                ])
+                
+                # Convert timestamp to datetime
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
+                summary = {
+                    "drivers_analyzed": df['driver_name'].unique().tolist(),
+                    "total_position_changes": len(df),
+                    "time_range": {
+                        "start": df['timestamp'].min().isoformat(),
+                        "end": df['timestamp'].max().isoformat()
+                    },
+                    "key_insights": []
+                }
+                
+                # Analyze each driver's performance
+                for driver in df['driver_name'].unique():
+                    driver_data = df[df['driver_name'] == driver].sort_values('timestamp')
+                    
+                    if len(driver_data) > 0:
+                        starting_pos = driver_data.iloc[0]['position']
+                        final_pos = driver_data.iloc[-1]['position']
+                        best_pos = driver_data['position'].min()
+                        worst_pos = driver_data['position'].max()
+                        
+                        # Count significant position changes
+                        significant_changes = driver_data[abs(driver_data['position_change']) > 2]
+                        overtakes = driver_data[driver_data['position_change'] < 0]
+                        positions_lost = driver_data[driver_data['position_change'] > 0]
+                        
+                        driver_summary = {
+                            "driver": driver,
+                            "team": driver_data.iloc[0]['team_name'],
+                            "starting_position": int(starting_pos),
+                            "final_position": int(final_pos),
+                            "best_position": int(best_pos),
+                            "worst_position": int(worst_pos),
+                            "position_improvement": int(starting_pos - final_pos),
+                            "significant_changes": len(significant_changes),
+                            "overtakes": len(overtakes),
+                            "positions_lost": len(positions_lost),
+                            "led_race": bool(driver_data['is_leader'].any())
+                        }
+                        
+                        summary["key_insights"].append(driver_summary)
+                
+                # Add overall race insights
+                if len(summary["key_insights"]) > 1:
+                    # Compare drivers if multiple
+                    drivers = summary["key_insights"]
+                    best_finisher = min(drivers, key=lambda x: x["final_position"])
+                    most_improved = max(drivers, key=lambda x: x["position_improvement"])
+                    most_active = max(drivers, key=lambda x: x["significant_changes"])
+                    
+                    summary["race_highlights"] = {
+                        "best_finisher": best_finisher["driver"],
+                        "most_improved": most_improved["driver"],
+                        "most_active": most_active["driver"],
+                        "total_overtakes": sum(d["overtakes"] for d in drivers),
+                        "total_significant_changes": sum(d["significant_changes"] for d in drivers)
+                    }
+                
+                return summary
+                
+            except Exception as e:
+                self.logger.error(f"Error summarizing position progression: {e}")
+                return {
+                    "error": "Failed to summarize data",
+                    "total_data_points": len(result),
+                    "note": "Request visualization for detailed analysis"
+                }
 
 class GetSectorAnalysisTool(BaseMCPTool):
     """Analyze sector times and identify strengths/weaknesses"""
@@ -1122,79 +1227,100 @@ class GetSectorAnalysisTool(BaseMCPTool):
             
             query = self.query_builder.build_sector_analysis_query(session_key, driver_filter, team_filter, sector_analysis_type)
             
-            # Build query parameters
+            # Build query parameters properly
             query_params = {"session_key": session_key}
+            
             if driver_filter:
-                query_params["driver_filter"] = driver_filter
+                # Handle comma-separated driver names
+                driver_names = [name.strip() for name in driver_filter.split(',')]
+                if len(driver_names) == 1:
+                    query_params["driver_filter"] = driver_names[0]
+                else:
+                    for i, driver in enumerate(driver_names):
+                        query_params[f"driver_{i}"] = driver.upper()
+            
             if team_filter:
-                query_params["team_filter"] = team_filter
+                # Handle comma-separated team names
+                team_names = [name.strip() for name in team_filter.split(',')]
+                if len(team_names) == 1:
+                    query_params["team_filter"] = team_names[0]
+                else:
+                    for i, team in enumerate(team_names):
+                        query_params[f"team_{i}"] = team.upper()
             
             result = self.db_connection.execute_mcp_query(query, query_params)
             
             if result:
                 sector_data = []
                 for row in result:
-                    # Handle different result structures based on analysis type
-                    if sector_analysis_type == "best_sectors":
-                        sector_data.append({
-                            "driver": row[0],
-                            "team": row[1],
-                            "best_sector1": float(row[2]) if row[2] else None,
-                            "best_sector2": float(row[3]) if row[3] else None,
-                            "best_sector3": float(row[4]) if row[4] else None,
-                            "avg_sector1": float(row[5]) if row[5] else None,
-                            "avg_sector2": float(row[6]) if row[6] else None,
-                            "avg_sector3": float(row[7]) if row[7] else None,
-                            "total_laps": row[8],
-                            "sector1_consistency": float(row[9]) if row[9] else None,
-                            "sector2_consistency": float(row[10]) if row[10] else None,
-                            "sector3_consistency": float(row[11]) if row[11] else None
-                        })
-                    elif sector_analysis_type == "consistency":
-                        sector_data.append({
-                            "driver": row[0],
-                            "team": row[1],
-                            "avg_sector1": float(row[2]) if row[2] else None,
-                            "avg_sector2": float(row[3]) if row[3] else None,
-                            "avg_sector3": float(row[4]) if row[4] else None,
-                            "sector1_consistency": float(row[5]) if row[5] else None,
-                            "sector2_consistency": float(row[6]) if row[6] else None,
-                            "sector3_consistency": float(row[7]) if row[7] else None,
-                            "total_laps": row[8],
-                            "overall_consistency": float(row[9]) if row[9] else None
-                        })
-                    elif sector_analysis_type == "comparison":
-                        sector_data.append({
-                            "driver": row[0],
-                            "team": row[1],
-                            "best_sector1": float(row[2]) if row[2] else None,
-                            "best_sector2": float(row[3]) if row[3] else None,
-                            "best_sector3": float(row[4]) if row[4] else None,
-                            "avg_sector1": float(row[5]) if row[5] else None,
-                            "avg_sector2": float(row[6]) if row[6] else None,
-                            "avg_sector3": float(row[7]) if row[7] else None,
-                            "sector1_gap_to_best": float(row[8]) if row[8] else None,
-                            "sector2_gap_to_best": float(row[9]) if row[9] else None,
-                            "sector3_gap_to_best": float(row[10]) if row[10] else None,
-                            "total_laps": row[11]
-                        })
-                    else:  # "all" - comprehensive analysis
-                        sector_data.append({
-                            "driver": row[0],
-                            "team": row[1],
-                            "best_sector1": float(row[2]) if row[2] else None,
-                            "best_sector2": float(row[3]) if row[3] else None,
-                            "best_sector3": float(row[4]) if row[4] else None,
-                            "avg_sector1": float(row[5]) if row[5] else None,
-                            "avg_sector2": float(row[6]) if row[6] else None,
-                            "avg_sector3": float(row[7]) if row[7] else None,
-                            "total_laps": row[8],
-                            "sector1_consistency": float(row[9]) if row[9] else None,
-                            "sector2_consistency": float(row[10]) if row[10] else None,
-                            "sector3_consistency": float(row[11]) if row[11] else None,
-                            "strongest_sector": row[12],
-                            "weakest_sector": row[13]
-                        })
+                    try:
+                        # Safely access tuple indices with bounds checking
+                        row_length = len(row)
+                        
+                        # Handle different result structures based on analysis type
+                        if sector_analysis_type == "best_sectors":
+                            sector_data.append({
+                                "driver": row[0] if row_length > 0 else None,
+                                "team": row[1] if row_length > 1 else None,
+                                "best_sector1": float(row[2]) if row_length > 2 and row[2] else None,
+                                "best_sector2": float(row[3]) if row_length > 3 and row[3] else None,
+                                "best_sector3": float(row[4]) if row_length > 4 and row[4] else None,
+                                "avg_sector1": float(row[5]) if row_length > 5 and row[5] else None,
+                                "avg_sector2": float(row[6]) if row_length > 6 and row[6] else None,
+                                "avg_sector3": float(row[7]) if row_length > 7 and row[7] else None,
+                                "total_laps": row[8] if row_length > 8 else None,
+                                "sector1_consistency": float(row[9]) if row_length > 9 and row[9] else None,
+                                "sector2_consistency": float(row[10]) if row_length > 10 and row[10] else None,
+                                "sector3_consistency": float(row[11]) if row_length > 11 and row[11] else None
+                            })
+                        elif sector_analysis_type == "consistency":
+                            sector_data.append({
+                                "driver": row[0] if row_length > 0 else None,
+                                "team": row[1] if row_length > 1 else None,
+                                "avg_sector1": float(row[2]) if row_length > 2 and row[2] else None,
+                                "avg_sector2": float(row[3]) if row_length > 3 and row[3] else None,
+                                "avg_sector3": float(row[4]) if row_length > 4 and row[4] else None,
+                                "sector1_consistency": float(row[5]) if row_length > 5 and row[5] else None,
+                                "sector2_consistency": float(row[6]) if row_length > 6 and row[6] else None,
+                                "sector3_consistency": float(row[7]) if row_length > 7 and row[7] else None,
+                                "total_laps": row[8] if row_length > 8 else None,
+                                "overall_consistency": float(row[9]) if row_length > 9 and row[9] else None
+                            })
+                        elif sector_analysis_type == "comparison":
+                            sector_data.append({
+                                "driver": row[0] if row_length > 0 else None,
+                                "team": row[1] if row_length > 1 else None,
+                                "best_sector1": float(row[2]) if row_length > 2 and row[2] else None,
+                                "best_sector2": float(row[3]) if row_length > 3 and row[3] else None,
+                                "best_sector3": float(row[4]) if row_length > 4 and row[4] else None,
+                                "avg_sector1": float(row[5]) if row_length > 5 and row[5] else None,
+                                "avg_sector2": float(row[6]) if row_length > 6 and row[6] else None,
+                                "avg_sector3": float(row[7]) if row_length > 7 and row[7] else None,
+                                "sector1_gap_to_best": float(row[8]) if row_length > 8 and row[8] else None,
+                                "sector2_gap_to_best": float(row[9]) if row_length > 9 and row[9] else None,
+                                "sector3_gap_to_best": float(row[10]) if row_length > 10 and row[10] else None,
+                                "total_laps": row[11] if row_length > 11 else None
+                            })
+                        else:  # "all" - comprehensive analysis
+                            sector_data.append({
+                                "driver": row[0] if row_length > 0 else None,
+                                "team": row[1] if row_length > 1 else None,
+                                "best_sector1": float(row[2]) if row_length > 2 and row[2] else None,
+                                "best_sector2": float(row[3]) if row_length > 3 and row[3] else None,
+                                "best_sector3": float(row[4]) if row_length > 4 and row[4] else None,
+                                "avg_sector1": float(row[5]) if row_length > 5 and row[5] else None,
+                                "avg_sector2": float(row[6]) if row_length > 6 and row[6] else None,
+                                "avg_sector3": float(row[7]) if row_length > 7 and row[7] else None,
+                                "total_laps": row[8] if row_length > 8 else None,
+                                "sector1_consistency": float(row[9]) if row_length > 9 and row[9] else None,
+                                "sector2_consistency": float(row[10]) if row_length > 10 and row[10] else None,
+                                "sector3_consistency": float(row[11]) if row_length > 11 and row[11] else None,
+                                "strongest_sector": row[12] if row_length > 12 else None,
+                                "weakest_sector": row[13] if row_length > 13 else None
+                            })
+                    except Exception as e:
+                        self.logger.warning(f"Error processing sector analysis row {row}: {e}")
+                        continue  # Skip this row and continue with others
                 
                 execution_time = time.time() - start_time
                 self.logger.info(f"GetSectorAnalysisTool completed successfully in {execution_time:.3f}s")

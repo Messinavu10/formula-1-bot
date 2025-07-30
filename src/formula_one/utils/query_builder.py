@@ -1296,9 +1296,9 @@ class QueryBuilder:
             AND st.lap_end IS NOT NULL
             AND st.compound IS NOT NULL
         ORDER BY d.full_name, st.lap_start
-        """
-    
-    def build_position_progression_query(self, session_key: str, driver_filter: str = None, team_filter: str = None):
+        """ 
+
+    def build_position_progression_query(self, session_key: str, driver_filter: str = None, team_filter: str = None, progression_type: str = "all"):
         """Build query to get position progression data directly from positions_transformed"""
         
         # Build filter conditions
@@ -1323,6 +1323,20 @@ class QueryBuilder:
         driver_clause = f"AND ({' OR '.join(driver_conditions)})" if driver_conditions else ""
         team_clause = f"AND ({' OR '.join(team_conditions)})" if team_conditions else ""
         
+        # Add progression type filtering
+        progression_filter = ""
+        if progression_type == "overtakes":
+            # Only show position changes where driver gained positions (negative change = improvement)
+            progression_filter = "AND p.position_change < 0"
+        elif progression_type == "key_moments":
+            # Show significant position changes (more than 2 positions)
+            progression_filter = "AND ABS(p.position_change) > 2"
+        elif progression_type == "lap_by_lap":
+            # Show all position data but order by lap progression
+            progression_filter = ""
+        else:  # "all" - default, show all position data
+            progression_filter = ""
+        
         return f"""
         SELECT 
             p.date,
@@ -1346,7 +1360,73 @@ class QueryBuilder:
         AND p.date IS NOT NULL
         {driver_clause}
         {team_clause}
+        {progression_filter}
         ORDER BY p.date ASC, p.position ASC
+        """
+    
+    def build_tire_strategy_query(self, session_key: str, driver_filter: str = None, team_filter: str = None, strategy_type: str = "all"):
+        """Build query to get tire strategy data for analysis"""
+        where_conditions = ["st.session_key = :session_key"]
+        params = {"session_key": session_key}
+        
+        if driver_filter:
+            # Check if it's multiple drivers (comma-separated)
+            if "," in driver_filter:
+                # Handle multiple drivers with OR condition
+                driver_names = [name.strip() for name in driver_filter.split(",")]
+                driver_conditions = []
+                for i, driver in enumerate(driver_names):
+                    param_name = f"driver_filter_{i}"
+                    driver_conditions.append(f"UPPER(d.full_name) = UPPER(:{param_name})")
+                    params[param_name] = driver
+                where_conditions.append(f"({' OR '.join(driver_conditions)})")
+            else:
+                # Single driver
+                where_conditions.append("UPPER(d.full_name) = UPPER(:driver_filter)")
+                params["driver_filter"] = driver_filter
+        
+        if team_filter:
+            # Check if it's multiple teams (comma-separated)
+            if "," in team_filter:
+                # Handle multiple teams with OR condition
+                team_names = [name.strip() for name in team_filter.split(",")]
+                team_conditions = []
+                for i, team in enumerate(team_names):
+                    param_name = f"team_filter_{i}"
+                    team_conditions.append(f"d.team_name = :{param_name}")
+                    params[param_name] = team
+                where_conditions.append(f"({' OR '.join(team_conditions)})")
+            else:
+                # Single team - use exact match instead of ILIKE
+                where_conditions.append("d.team_name = :team_filter")
+                params["team_filter"] = team_filter
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        return f"""
+        SELECT 
+            d.full_name,
+            d.team_name,
+            st.compound,
+            st.lap_start,
+            st.lap_end,
+            (st.lap_end - st.lap_start + 1) as stint_length,
+            ROUND(AVG(l.lap_duration)::numeric, 3) as avg_lap_time
+        FROM stints_transformed st
+        JOIN drivers_transformed d ON st.driver_number = d.driver_number 
+            AND st.session_key = d.session_key
+        LEFT JOIN laps_transformed l ON st.driver_number = l.driver_number 
+            AND st.session_key = l.session_key
+            AND l.lap_number BETWEEN st.lap_start AND st.lap_end
+            AND l.lap_duration IS NOT NULL
+            AND l.lap_duration > 0
+            AND COALESCE(l.is_outlier, false) = false
+        WHERE {where_clause}
+            AND st.compound IS NOT NULL
+            AND st.lap_start IS NOT NULL
+            AND st.lap_end IS NOT NULL
+        GROUP BY d.full_name, d.team_name, st.compound, st.lap_start, st.lap_end
+        ORDER BY d.full_name, st.lap_start
         """
 
     def build_tire_strategy_viz_query(self, session_key: str, driver_filter: str = None, team_filter: str = None, strategy_type: str = "all", viz_type: str = "gantt"):

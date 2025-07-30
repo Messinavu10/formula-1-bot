@@ -179,7 +179,7 @@ class VisualizationGenerator(BaseComponent):
             
             # Update layout
             fig.update_layout(
-                title=f"Lap Time Progression - Session {session_key}",
+                title=f"Lap Time Progression",
                 xaxis_title="Lap Number",
                 yaxis_title="Lap Time (seconds)",
                 template="plotly_dark",

@@ -95,7 +95,7 @@ class CreatePositionProgressionTool(BaseVisualizationTool):
                 error=str(e),
                 execution_time=execution_time
             )
-
+        
 class CreateSectorAnalysisTool(BaseVisualizationTool):
     """Create sector analysis visualization for a session"""
     category = "visualization"
@@ -106,10 +106,11 @@ class CreateSectorAnalysisTool(BaseVisualizationTool):
         try:
             session_key = params.get("session_key")
             driver_filter = params.get("driver_filter")
+            team_filter = params.get("team_filter")
             
-            self.logger.info(f"Executing CreateSectorAnalysisTool for session {session_key}")
+            self.logger.info(f"Executing CreateSectorAnalysisTool for session {session_key} with driver_filter: {driver_filter}, team_filter: {team_filter}")
             
-            result = self.viz_generator.create_sector_analysis(session_key, driver_filter)
+            result = self.viz_generator.create_sector_analysis(session_key, driver_filter, team_filter)
             
             execution_time = time.time() - start_time
             self.logger.info(f"CreateSectorAnalysisTool completed in {execution_time:.3f}s")
