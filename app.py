@@ -32,6 +32,8 @@ artifacts_dir.mkdir(exist_ok=True)
 # Mount static files for serving visualizations
 app.mount("/artifacts", StaticFiles(directory="artifacts"), name="artifacts")
 
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+
 # Initialize MCP pipeline
 mcp_pipeline = None
 
