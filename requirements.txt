@@ -26,3 +26,4 @@ python-dotenv
 nest_asyncio
 fastapi
 uvicorn
+chromadb

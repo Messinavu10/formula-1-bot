@@ -1489,3 +1489,74 @@ class GetSessionInfoTool(BaseMCPTool):
                 error=str(e),
                 execution_time=execution_time
             )
+
+class GetTeamDriversTool(BaseMCPTool):
+    """Get all drivers for a specific team in a session"""
+    category = "utility"
+    
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        start_time = time.time()
+        
+        try:
+            session_key = params.get("session_key")
+            team_name = params.get("team_name")
+            
+            self.logger.info(f"Executing GetTeamDriversTool for team {team_name} in session {session_key}")
+            
+            query = self.query_builder.build_team_drivers_query(session_key, team_name)
+            
+            search_params = {
+                "session_key": session_key,
+                "team_name_pattern": f"%{team_name}%"
+            }
+            
+            result = self.db_connection.execute_mcp_query(query, search_params)
+            
+            if result and len(result) > 0:
+                drivers = []
+                for row in result:
+                    drivers.append({
+                        "full_name": row[0],
+                        "team_name": row[1],
+                        "driver_number": row[2]
+                    })
+                
+                data = {
+                    "team_name": team_name,
+                    "drivers": drivers,
+                    "driver_count": len(drivers)
+                }
+                
+                execution_time = time.time() - start_time
+                self.logger.info(f"GetTeamDriversTool completed successfully in {execution_time:.3f}s")
+                
+                return ToolResult(
+                    success=True,
+                    data=data,
+                    sql_query=query,
+                    sql_params=search_params,
+                    execution_time=execution_time
+                )
+            else:
+                execution_time = time.time() - start_time
+                self.logger.warning(f"GetTeamDriversTool: No drivers found for team '{team_name}' in session {session_key}")
+                
+                return ToolResult(
+                    success=False,
+                    data={},
+                    error=f"No drivers found for team '{team_name}' in session {session_key}",
+                    sql_query=query,
+                    sql_params=search_params,
+                    execution_time=execution_time
+                )
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            self.logger.error(f"GetTeamDriversTool failed: {e}")
+            
+            return ToolResult(
+                success=False,
+                data={},
+                error=str(e),
+                execution_time=execution_time
+            )

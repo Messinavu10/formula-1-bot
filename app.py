@@ -8,6 +8,7 @@ import asyncio
 from typing import Dict, Any
 import logging
 from pathlib import Path
+from collections import defaultdict
 
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -36,6 +37,9 @@ app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 # Initialize MCP pipeline
 mcp_pipeline = None
+
+# Session management - store conversation history per session
+session_conversations = defaultdict(list)
 
 @app.on_event("startup")
 async def startup_event():
@@ -71,6 +75,7 @@ async def chat_endpoint(request: Request):
     try:
         data = await request.json()
         user_message = data.get("message", "").strip()
+        session_id = data.get("session_id", "default")
         
         if not user_message:
             return {"error": "Message cannot be empty"}
@@ -78,14 +83,35 @@ async def chat_endpoint(request: Request):
         if not mcp_pipeline:
             return {"error": "F1 Assistant is not ready. Please try again."}
         
-        # Get response from reasoning engine
-        response = mcp_pipeline.test_reasoning_engine(user_message)
+        # Get conversation history for this session
+        conversation_history = session_conversations[session_id]
         
-        # Check if response contains visualization data
-        visualization_data = None
-        if hasattr(mcp_pipeline, 'last_visualization') and mcp_pipeline.last_visualization:
-            visualization_data = mcp_pipeline.last_visualization
-            mcp_pipeline.last_visualization = None  # Clear after sending
+        # Update the reasoning engine's context manager with the session history
+        mcp_pipeline.reasoning_engine.context_manager.conversation_history = conversation_history
+        
+        # Add debug logging
+        print(f"🔍 Session {session_id}: Restored {len(conversation_history)} conversation entries")
+        
+        # Get response from reasoning engine
+        result = mcp_pipeline.test_reasoning_engine(user_message)
+        
+        # Handle the response (it might be a tuple now)
+        if isinstance(result, tuple):
+            response, visualization_data = result
+        else:
+            # Backward compatibility for when test_reasoning_engine returns just a string
+            response = result
+            visualization_data = None
+        
+        # Update session history with the new exchange
+        session_conversations[session_id] = mcp_pipeline.reasoning_engine.context_manager.conversation_history
+        
+        # Add debug logging
+        print(f"🔍 Session {session_id}: Updated to {len(session_conversations[session_id])} conversation entries")
+        
+        # Add debug logging for visualization data
+        if visualization_data:
+            print(f" Visualization data: {visualization_data}")
         
         return {
             "response": response,
@@ -100,37 +126,20 @@ async def chat_endpoint(request: Request):
 @app.get("/api/visualization/{filename}")
 async def get_visualization(filename: str):
     """Serve visualization files"""
-    try:
-        viz_path = Path("artifacts/visualizations") / filename
-        if viz_path.exists():
-            return FileResponse(
-                path=str(viz_path),
-                media_type="text/html",
-                # Remove filename parameter to prevent download
-                headers={
-                    "Content-Disposition": "inline",  # Display in browser, don't download
-                    "X-Frame-Options": "SAMEORIGIN"  # Allow iframe embedding
-                }
-            )
-        else:
-            return {"error": "Visualization not found"}
-    except Exception as e:
-        logging.error(f"Error serving visualization {filename}: {e}")
-        return {"error": "Error serving visualization"}
+    # Look in the visualizations subdirectory
+    file_path = Path("artifacts/visualizations") / filename
+    if file_path.exists():
+        return FileResponse(file_path)
+    else:
+        # Add debug logging to see what path is being checked
+        print(f"🔍 Looking for visualization file: {file_path}")
+        print(f"�� File exists: {file_path.exists()}")
+        return {"error": "Visualization not found"}
 
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "mcp_ready": mcp_pipeline is not None
-    }
+    return {"status": "healthy", "timestamp": asyncio.get_event_loop().time()}
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8080,
-        reload=False,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8080)

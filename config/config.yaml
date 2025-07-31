@@ -129,3 +129,22 @@ tools:
   enable_performance_metrics: true
   max_query_results: 100
   default_session_type: "Race"
+
+advanced_memory:
+  vector_db_path: "artifacts/memory"
+  max_context_exchanges: 5
+  max_cache_size: 10
+  similarity_threshold: 0.7
+  entity_overlap_weight: 0.6
+  semantic_similarity_weight: 0.4
+  
+  # Memory cleanup settings
+  cleanup_old_entries: true
+  max_memory_age_days: 30
+  max_total_entries: 1000
+  
+  # Context generation settings
+  include_entity_matches: true
+  include_semantic_matches: true
+  include_conversation_summary: true
+  max_context_length: 1000

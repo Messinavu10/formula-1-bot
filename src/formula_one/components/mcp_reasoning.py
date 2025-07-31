@@ -13,6 +13,8 @@ from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.entity.mcp_config_entity import MCPConfig
 from sentence_transformers import SentenceTransformer
 
+from src.formula_one.components.enhanced_context_memory import EnhancedContextManager
+
 
 class IntentAnalyzer(BaseComponent):
     """Analyze user query intent and extract information"""
@@ -82,7 +84,7 @@ class IntentAnalyzer(BaseComponent):
         self.pattern_embeddings = {}
         for intent, patterns in self.intent_patterns.items():
             self.pattern_embeddings[intent] = self.model.encode(patterns)
-    
+
     def analyze_query_intent(self, user_query: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
         """Analyze user query to determine intent and extract relevant information"""
         
@@ -110,7 +112,7 @@ class IntentAnalyzer(BaseComponent):
                 self.logger.info(f"🔍 Checking history entry {i}: {entry}")
                 previous_query_type = self._determine_query_type(entry["message"].lower())
                 self.logger.info(f"🔍 Previous query type: {previous_query_type}")
-                if previous_query_type in ["tire_strategy", "pit_strategy", "sector_analysis", "comparison","position_analysis"]:
+                if previous_query_type in ["tire_strategy", "pit_strategy", "sector_analysis", "comparison", "position_analysis"]:
                     self.logger.info(f"🔍 Using query type from conversation history: {previous_query_type}")
                     query_type = previous_query_type
                     break
@@ -156,18 +158,18 @@ class IntentAnalyzer(BaseComponent):
         
         # Combine all analysis results
         analysis_result = {
-            "query_type": query_type,  # Make sure this is included
+            "query_type": query_type,
             "meeting_info": meeting_info,
             "session_type": session_type,
             "drivers": drivers,
-            "teams": teams,  # Add teams to the analysis result
+            "teams": teams,
             "lap_number": lap_number,
             "context": context
         }
         
         # Add debugging
         self.logger.info(f"�� Analysis result: {analysis_result}")
-        
+    
         return analysis_result
     
     def _extract_lap_number(self, query: str) -> Optional[int]:
@@ -220,7 +222,8 @@ class IntentAnalyzer(BaseComponent):
             'british': 'British Grand Prix',
             'silverstone': 'British Grand Prix',
             'great britain': 'British Grand Prix',
-            'belgian' : 'Belgian Grand Prix'
+            'belgian' : 'Belgian Grand Prix',
+            'spa' : 'Belgian Grand Prix'
         }
         
         query_lower = query.lower()
@@ -242,6 +245,10 @@ class IntentAnalyzer(BaseComponent):
     
     def _get_context_from_history(self, conversation_history: List[Dict]) -> Dict[str, Any]:
         """Get context from recent conversation history"""
+        # Add null check to prevent TypeError
+        if not conversation_history:
+            return {"name": None, "year": 2025}
+        
         for entry in reversed(conversation_history[-3:]):
             previous_meeting = self._extract_meeting_info(entry["message"])
             if previous_meeting["name"]:
@@ -466,6 +473,7 @@ class IntentAnalyzer(BaseComponent):
 
         self.logger.info(f"✅ Semantic similarity matched: {best_intent} (score: {best_score:.3f})")
         return best_intent
+
     
     def _extract_driver_names(self, query: str) -> List[str]:
         """Extract driver names from query"""
@@ -504,64 +512,6 @@ class IntentAnalyzer(BaseComponent):
         
         return found_drivers 
 
-class ContextManager(BaseComponent):
-    """Manage conversation context and clarification handling"""
-    
-    def __init__(self, config, db_config: DatabaseConfig):
-        super().__init__(config, db_config)
-        self.conversation_history = []
-        self.last_clarification_context = None
-        self.last_meeting_context = None  # ← Add this like your notebook
-    
-    def add_to_history(self, message: str, response: str):
-        """Add to conversation history"""
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "message": message,
-            "response": response
-        }
-        self.conversation_history.append(entry)
-        self.logger.info(f"🔍 Added to conversation history: {entry}")
-        self.logger.info(f"�� Total conversation history entries: {len(self.conversation_history)}")
-        self.logger.info(f"🔍 Full conversation history: {self.conversation_history}")
-    
-    def is_clarification_response(self, user_query: str) -> bool:
-        """Check if this is a clarification response"""
-        if not self.conversation_history:
-            return False
-        
-        last_response = self.conversation_history[-1]["response"]
-        
-        clarification_patterns = [
-            "Would you like me to create a visualization chart",
-            "Would you prefer a text summary",
-            "Would you like a visualization chart or a text summary",
-            "I can help you with that! Would you like me to create",
-            "Would you like a visualization or a text summary"
-        ]
-
-        return any(pattern in last_response for pattern in clarification_patterns)
-    
-    def get_clarification_context(self) -> Optional[Dict[str, Any]]:
-        """Get context for clarification response"""
-        return self.last_clarification_context
-    
-    def set_clarification_context(self, context: Dict[str, Any]):
-        """Set context for pending clarification"""
-        self.last_clarification_context = context
-    
-    def clear_clarification_context(self):
-        """Clear pending clarification context"""
-        self.last_clarification_context = None
-    
-    def set_last_meeting_context(self, meeting_info: Dict[str, Any]):
-        """Set the last meeting context for follow-ups"""
-        self.last_meeting_context = meeting_info
-    
-    def get_last_meeting_context(self) -> Optional[Dict[str, Any]]:
-        """Get the last meeting context"""
-        return self.last_meeting_context
-
 class ReasoningEngine(BaseComponent):
     """Main reasoning engine for processing F1 queries"""
     
@@ -570,7 +520,7 @@ class ReasoningEngine(BaseComponent):
         self.tools = tools
         self.http_client = http_client
         self.intent_analyzer = IntentAnalyzer(config, db_config)
-        self.context_manager = ContextManager(config, db_config)
+        self.context_manager = EnhancedContextManager(config, db_config)  # Use enhanced context manager
 
         self.logger.info(f"🔍 Config openai_api_key type: {type(config.openai_api_key)}")
         self.logger.info(f"🔍 Config openai_api_key value: {config.openai_api_key}")
@@ -589,55 +539,100 @@ class ReasoningEngine(BaseComponent):
             temperature=0.3,
             openai_api_key=api_key
         )
- 
+
     def reason_and_answer(self, user_query: str) -> str:
         """Main reasoning method that analyzes query and generates response"""
         try:
             self.logger.info(f"🧠 Processing query: '{user_query}'")
-            self.logger.info(f"🔍 ReasoningEngine instance ID: {id(self)}")
-            self.logger.info(f"🔍 ContextManager instance ID: {id(self.context_manager)}")
-            self.logger.info(f"🔍 Current conversation history length: {len(self.context_manager.conversation_history)}")
-            if self.context_manager.conversation_history:
-                self.logger.info(f"🔍 Last conversation entry: {self.context_manager.conversation_history[-1]}")
             
-            # Store the current conversation history for analysis (BEFORE adding temp entry)
-            current_history = self.context_manager.conversation_history.copy()
+            # Get conversation history from context manager
+            conversation_history = self.context_manager.conversation_history
             
-            # Add the current query to conversation history BEFORE analysis
-            # This ensures that subsequent queries can access the previous query
-            temp_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "message": user_query,
-                "response": ""  # Empty response for now
-            }
-            self.context_manager.conversation_history.append(temp_entry)
+            # Add debug logging
+            self.logger.info(f"🔍 Conversation history length: {len(conversation_history)}")
+            if conversation_history:
+                self.logger.info(f"🔍 Last conversation entry: {conversation_history[-1]}")
+                
+                # Check if the last response was asking for clarification
+                last_response = conversation_history[-1].get("response", "")
+                self.logger.info(f"🔍 Last response contains clarification patterns: {any(pattern in last_response for pattern in ['Could you please specify', 'I cannot identify'])}")
             
-            # Analyze the query using the PREVIOUS history (not including current query)
-            query_analysis = self.intent_analyzer.analyze_query_intent(user_query, current_history)
+            # Check if this is a clarification response to a previous query
+            if conversation_history and self.context_manager.is_clarification_response(user_query):
+                self.logger.info(f"🔍 Detected clarification response: {user_query}")
+                
+                # Get the clarification context
+                clarification_context = self.context_manager.get_clarification_context()
+                if clarification_context:
+                    self.logger.info(f"🔍 Found clarification context: {clarification_context}")
+                    
+                    # Extract meeting info from the clarification response
+                    meeting_info = self.intent_analyzer._extract_meeting_info(user_query)
+                    
+                    # Combine the clarification with the original context
+                    combined_query_analysis = {
+                        "query_type": clarification_context.get("query_type", "race_results"),
+                        "meeting_info": meeting_info,
+                        "session_type": clarification_context.get("session_type", "Race"),
+                        "drivers": clarification_context.get("drivers", []),
+                        "teams": clarification_context.get("teams", []),
+                        "lap_number": None,
+                        "context": clarification_context.get("meeting_info", {})
+                    }
+                    
+                    self.logger.info(f"🔍 Combined query analysis: {combined_query_analysis}")
+                    
+                    # Clear the clarification context
+                    self.context_manager.clear_clarification_context()
+                    
+                    # Execute tools with the combined context
+                    tool_results = self._execute_tools_for_query(user_query, combined_query_analysis)
+                    self.logger.info(f"🧠 Tool results for clarification: {tool_results}")
+                    
+                    # Generate response
+                    if "error" in tool_results:
+                        response = f"I apologize, but I encountered an error: {tool_results['error']}"
+                    else:
+                        response = self._generate_intelligent_summary(user_query, combined_query_analysis, tool_results)
+                    
+                    # Add to conversation history with enhanced context
+                    self.context_manager.add_to_history(user_query, response, combined_query_analysis)
+                    
+                    return response, tool_results.get("visualization")
+                else:
+                    self.logger.warning(f"🔍 No clarification context found for: {user_query}")
+            else:
+                self.logger.info(f"🔍 Not a clarification response: {user_query}")
+                if conversation_history:
+                    last_response = conversation_history[-1].get("response", "")
+                    self.logger.info(f"🔍 Last response: {last_response[:100]}...")
+                    self.logger.info(f"🔍 is_clarification_response returned: {self.context_manager.is_clarification_response(user_query)}")
+            
+            # Analyze the query with conversation history
+            query_analysis = self.intent_analyzer.analyze_query_intent(user_query, conversation_history)
             self.logger.info(f"🧠 Query analysis: {query_analysis}")
             
-            # Remove the temporary entry after analysis
-            self.context_manager.conversation_history.pop()
+            # Get enhanced context from ChromaDB
+            enhanced_context = self.context_manager.get_enhanced_context(user_query, query_analysis)
+            self.logger.info(f"🔍 Enhanced context: {enhanced_context}")
             
-            self.logger.info(f"🔍 After analysis - checking for ambiguous query")
-            # Check for ambiguous queries that need clarification
-            ambiguous_response = self._check_for_ambiguous_query(user_query, query_analysis)
-            if ambiguous_response:
-                self.logger.info(f"🔍 Returning ambiguous response: {ambiguous_response}")
-                return ambiguous_response
-            
-            self.logger.info(f"🔍 After ambiguous check - checking for clarification response")
-            # Check for clarification responses
-            clarification_response = self._handle_clarification_response(user_query, query_analysis)
-            if clarification_response:
-                self.logger.info(f"🧠 Clarification response: {clarification_response}")
-                return clarification_response
-            
-            self.logger.info(f"🔍 After clarification check - checking meeting info")
             # Check if meeting is identified
-            if not query_analysis["meeting_info"]["name"]:
+            meeting_info = query_analysis.get("meeting_info", {})
+            if not meeting_info or not meeting_info.get("name"):
                 self.logger.info(f"🔍 No meeting identified, generating clarification")
-                # Use LLM to generate a natural clarification
+                
+                # Store context for when user provides clarification
+                self.context_manager.set_clarification_context({
+                    "query_type": query_analysis.get("query_type"),
+                    "meeting_info": meeting_info,
+                    "session_type": query_analysis.get("session_type"),
+                    "drivers": query_analysis.get("drivers", []),
+                    "teams": query_analysis.get("teams", []),
+                    "original_query": user_query
+                })
+                
+                self.logger.info(f"🔍 Stored clarification context: {self.context_manager.get_clarification_context()}")
+                
                 clarification_prompt = f"""
     The user asked: "{user_query}"
 
@@ -647,32 +642,34 @@ class ReasoningEngine(BaseComponent):
                 
                 try:
                     response = self.llm.invoke(clarification_prompt).content
+                    # ADD THIS: Add the clarification request to conversation history
+                    self.context_manager.add_to_history(user_query, response, query_analysis)
+                    self.logger.info(f"🔍 Added clarification request to history")
                     return response
                 except Exception as e:
                     self.logger.warning(f"Failed to generate meeting clarification with LLM: {e}")
-                    return ("I'd be happy to help! However, I couldn't identify which race you're asking about. "
+                    fallback_response = ("I'd be happy to help! However, I couldn't identify which race you're asking about. "
                         "Could you please specify the race? For example: 'Bahrain Grand Prix', 'Miami Grand Prix', "
                         "'Chinese Grand Prix', etc.")
+                    # ADD THIS: Add the fallback clarification to conversation history
+                    self.context_manager.add_to_history(user_query, fallback_response, query_analysis)
+                    self.logger.info(f"🔍 Added fallback clarification to history")
+                    return fallback_response
             
-            self.logger.info(f"🔍 About to execute tools for query type: {query_analysis['query_type']}")
             # Execute tools based on query analysis
             tool_results = self._execute_tools_for_query(user_query, query_analysis)
             self.logger.info(f"🧠 Tool results: {tool_results}")
             
-            # Generate intelligent summary
+            # Generate intelligent summary with enhanced context
             if "error" in tool_results:
                 response = f"I apologize, but I encountered an error: {tool_results['error']}"
             else:
-                response = self._generate_intelligent_summary(user_query, query_analysis, tool_results)
+                # Generate context prompt from enhanced context
+                context_prompt = self.context_manager.generate_context_prompt(enhanced_context)
+                response = self._generate_intelligent_summary_with_context(user_query, query_analysis, tool_results, context_prompt)
             
-            self.logger.info(f"🔍 About to add to conversation history")
-            # Add to conversation history
-            self.context_manager.add_to_history(user_query, response)
-            
-            # Debug: Check conversation history after adding
-            self.logger.info(f"🔍 After adding to history - length: {len(self.context_manager.conversation_history)}")
-            if self.context_manager.conversation_history:
-                self.logger.info(f"🔍 After adding - last entry: {self.context_manager.conversation_history[-1]}")
+            # Add to conversation history with enhanced context
+            self.context_manager.add_to_history(user_query, response, query_analysis)
             
             # Return both response and visualization data
             return response, tool_results.get("visualization")
@@ -680,6 +677,423 @@ class ReasoningEngine(BaseComponent):
         except Exception as e:
             self.logger.error(f"❌ Error in reasoning: {e}")
             return f"I apologize, but I encountered an error while processing your request: {str(e)}", None
+    
+    def _generate_intelligent_summary_with_context(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any], context_prompt: str) -> str:
+        """Generate intelligent summary with enhanced context"""
+        
+        if "error" in tool_results:
+            return f"I apologize, but I encountered an error: {tool_results['error']}"
+        
+        # Create a filtered version of tool_results for LLM
+        filtered_tool_results = {}
+        for key, value in tool_results.items():
+            if key == "visualization":
+                if value.get("success"):
+                    viz_data = value
+                    filtered_tool_results[key] = {
+                        "success": viz_data.get("success"),
+                        "visualization_type": viz_data.get("visualization_type", "data visualization"),
+                        "filename": viz_data.get("filename"),
+                        "session_key": viz_data.get("session_key"),
+                        "total_laps": viz_data.get("total_laps"),
+                        "total_drivers": viz_data.get("total_drivers"),
+                        "drivers_included": viz_data.get("drivers_included", [])[:5]
+                    }
+            else:
+                filtered_tool_results[key] = value
+        
+        # Determine query type and use appropriate prompt
+        query_type = query_analysis.get("query_type", "")
+        
+        if query_type == "visualization":
+            summary_prompt = self._get_visualization_prompt_with_context(user_query, query_analysis, filtered_tool_results, context_prompt)
+        else:
+            summary_prompt = self._get_text_query_prompt_with_context(user_query, query_analysis, filtered_tool_results, context_prompt)
+        
+        try:
+            messages = [SystemMessage(content=summary_prompt)]
+            response = self.llm.invoke(messages)
+            answer = response.content
+            
+            return answer
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error generating summary: {e}")
+            return self._generate_basic_summary(user_query, query_analysis, tool_results)
+
+
+    def _get_visualization_prompt_with_context(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], context_prompt: str) -> str:
+        """Generate prompt for visualization with enhanced context"""
+        return f"""{context_prompt}
+
+    You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary about the visualization you've created.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Data Retrieved:
+    {json.dumps(filtered_tool_results, indent=2)}
+
+    I have generated a data visualization for you to view below.
+
+    VISUALIZATION RESPONSE REQUIREMENTS:
+    1. Start with a friendly, brief introduction about what you've created
+    2. Mention the specific race and session
+    3. Explain what the visualization shows and what insights can be gained
+    4. Mention that graph analysis capabilities will be available soon
+    5. Keep it concise and to the point
+    6. Do NOT mention filenames or technical details
+
+    FORMATTING FOR VISUALIZATIONS:
+    - Be friendly but concise
+    - Do NOT list individual driver names unless specifically asked
+    - Focus on what the visualization shows, not who is included
+    - Use proper line breaks between sections
+    - Keep the tone engaging but factual
+    - Do NOT mention file paths, filenames, or technical implementation details
+
+    Write your response in a friendly, conversational tone with proper line breaks and formatting.
+    """
+
+    def _get_text_query_prompt_with_context(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], context_prompt: str) -> str:
+        """Generate prompt for text queries with enhanced context"""
+        
+        # Check if this is a comparison query
+        if query_analysis.get("query_type") == "comparison" and "driver_comparison" in filtered_tool_results:
+            return f"""{context_prompt}
+
+    You are an expert F1 analyst. The user is asking for a comparison between specific drivers. Focus ONLY on comparing the two drivers mentioned.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Driver Comparison Data:
+    {json.dumps(filtered_tool_results.get("driver_comparison", {}), indent=2)}
+
+    DRIVER COMPARISON RESPONSE REQUIREMENTS:
+    1. Focus ONLY on comparing the two specific drivers that were requested
+    2. Present their performance side by side
+    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
+    4. Highlight who was faster, more consistent, etc.
+    5. Do NOT mention other drivers or podium finishers unless specifically relevant
+    6. Keep the response focused and concise
+
+    FORMATTING FOR DRIVER COMPARISON:
+    - Start with a brief introduction mentioning the two drivers being compared
+    - Present each driver's key metrics (best lap, average lap, consistency)
+    - Provide a direct comparison highlighting the differences
+    - Keep it factual and focused on the requested comparison
+
+    Example format:
+    Max Verstappen vs Lewis Hamilton - Monaco GP 2025 Race Comparison:
+
+    Max Verstappen (Red Bull Racing):
+    - Best Lap: 01:14.230
+    - Average Lap: 01:17.962
+    - Consistency: 6.904 seconds
+
+    Lewis Hamilton (Ferrari):
+    - Best Lap: 01:14.089
+    - Average Lap: 01:18.075
+    - Consistency: 6.728 seconds
+
+    Comparison: Lewis Hamilton was slightly faster with a best lap of 01:14.089 vs Verstappen's 01:14.230, but Verstappen had a better average lap time.
+
+    Write your response focusing specifically on the requested driver comparison.
+    """
+        elif query_analysis.get("query_type") == "position_analysis" and "position_progression" in filtered_tool_results:
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for position progression analysis.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+    Drivers: {query_analysis.get("drivers", [])}
+    Position Progression Data:
+    {json.dumps(filtered_tool_results.get("position_progression", {}), indent=2)}
+
+    POSITION PROGRESSION ANALYSIS RESPONSE REQUIREMENTS:
+    1. Analyze the position changes throughout the race for the specified driver(s)
+    2. Identify key moments when positions changed significantly
+    3. Explain the factors that led to position gains or losses
+    4. Highlight strategic overtakes, pit stops, or incidents that affected positions
+    5. Compare the driver's starting position to their finishing position
+    6. Provide insights on race pace, consistency, and strategic decisions
+    7. Mention any notable battles or defensive driving
+    8. Analyze the overall race strategy and its effectiveness
+
+    TIME FORMATTING REQUIREMENTS:
+    - Convert timestamps to readable format: "Lap X" or "XX minutes into the race"
+    - Use relative time references like "early in the race", "mid-race", "towards the end"
+    - For specific lap references, use "Lap X" format
+    - Avoid raw timestamps like "13:29:16.778"
+    - Use natural language like "around the 15-minute mark" or "with 10 laps remaining"
+
+    ANALYSIS STRUCTURE:
+    - Start with an overview of the driver's race performance
+    - Break down the race into key phases (start, middle, end)
+    - Identify the most significant position changes and their causes
+    - Compare performance to expectations and qualifying position
+    - Provide insights on race strategy and execution
+    - Conclude with an overall assessment of the driver's performance
+
+    EXAMPLE TIME FORMATTING:
+    Instead of: "He moved to 3rd place at 13:29:16.778"
+    Use: "He moved to 3rd place early in the race" or "He moved to 3rd place around Lap 5"
+
+    Instead of: "He dropped to 2nd place at 13:40:42.106"
+    Use: "He dropped to 2nd place during his first pit stop" or "He dropped to 2nd place around the 20-minute mark"
+
+    Write your response focusing specifically on the position progression analysis with properly formatted time references."""
+        
+        elif query_analysis.get("query_type") == "sector_analysis" and "sector_analysis" in filtered_tool_results:
+            # Filter and summarize sector analysis data to reduce token count
+            sector_data = filtered_tool_results.get("sector_analysis", {})
+            if "sector_data" in sector_data:
+                # Extract only the essential information for each driver
+                summarized_data = []
+                for driver_data in sector_data["sector_data"]:
+                    if driver_data.get("driver") and driver_data.get("best_sector1"):
+                        summarized_data.append({
+                            "driver": driver_data["driver"],
+                            "team": driver_data["team"],
+                            "best_sector1": driver_data["best_sector1"],
+                            "best_sector2": driver_data["best_sector2"],
+                            "best_sector3": driver_data["best_sector3"],
+                            "avg_sector1": driver_data.get("avg_sector1"),
+                            "avg_sector2": driver_data.get("avg_sector2"),
+                            "avg_sector3": driver_data.get("avg_sector3")
+                        })
+                
+                sector_data["sector_data"] = summarized_data
+
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for a sector comparison between specific drivers. Focus ONLY on comparing the sector performance of the drivers mentioned.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Sector Analysis Data:
+    {json.dumps(sector_data, indent=2)}
+
+    SECTOR COMPARISON RESPONSE REQUIREMENTS:
+    1. Focus ONLY on comparing the sector performance of the specific drivers requested
+    2. Present their sector times side by side for each sector (Sector 1, Sector 2, Sector 3)
+    3. Convert sector times from seconds to MM:SS.mmm format (e.g., 28.701 seconds becomes 00:28.701)
+    4. Highlight which driver was faster in each sector
+    5. Identify each driver's strongest and weakest sectors
+    6. Do NOT mention other drivers unless specifically relevant
+    7. Keep the response focused and concise
+
+    FORMATTING FOR SECTOR COMPARISON:
+    - Start with a brief introduction mentioning the two drivers being compared
+    - Present each driver's best sector times for all three sectors
+    - Provide a direct comparison highlighting the differences in each sector
+    - Identify which driver was faster in each sector
+    - Keep it factual and focused on the requested sector comparison
+
+    Example format:
+    Charles Leclerc vs Lando Norris - British GP 2025 Sector Comparison:
+
+    Charles Leclerc (Ferrari):
+    - Best Sector 1: 00:28.701
+    - Best Sector 2: 00:36.674
+    - Best Sector 3: 00:24.312
+
+    Lando Norris (McLaren):
+    - Best Sector 1: 00:28.747
+    - Best Sector 2: 00:36.673
+    - Best Sector 3: 00:24.312
+
+    Comparison: Charles Leclerc was faster in Sector 1 by 0.046 seconds, while Lando Norris was faster in Sector 2 by 0.001 seconds. Both drivers were equally fast in Sector 3.
+
+    Write your response focusing specifically on the requested sector comparison.
+    """
+        elif query_analysis.get("query_type") == "comparison" and "team_comparison" in filtered_tool_results:
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for a comparison between specific teams. Focus ONLY on comparing the two teams mentioned.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Team Comparison Data:
+    {json.dumps(filtered_tool_results.get("team_comparison", {}), indent=2)}
+
+    TEAM COMPARISON RESPONSE REQUIREMENTS:
+    1. Focus ONLY on comparing the two specific teams that were requested
+    2. Present their performance side by side
+    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
+    4. Highlight which team was faster, more consistent, etc.
+    5. Include individual driver performance within each team
+    6. Do NOT mention other teams or podium finishers unless specifically relevant
+    7. Keep the response focused and concise
+
+    FORMATTING FOR TEAM COMPARISON:
+    - Start with a brief introduction mentioning the two teams being compared
+    - Present each team's overall performance (total laps, average lap, best lap, consistency)
+    - Include individual driver performance within each team
+    - Provide a direct comparison highlighting the differences
+    - Keep it factual and focused on the requested team comparison
+
+    Example format:
+    Mercedes vs Red Bull Racing - Monaco GP 2025 Race Comparison:
+
+    Mercedes:
+    - Total Laps: 151
+    - Average Lap: 01:20.194
+    - Best Lap: 01:13.404
+    - Consistency: 6.441 seconds
+    - Best Position: 11th
+    - Drivers: George Russell (best lap: 01:13.404) and Kimi Antonelli (best lap: 01:13.518)
+
+    Red Bull Racing:
+    - Total Laps: 154
+    - Average Lap: 01:19.028
+    - Best Lap: 01:14.230
+    - Consistency: 6.404 seconds
+    - Best Position: 4th
+    - Drivers: Max Verstappen (best lap: 01:14.230) and Yuki Tsunoda (best lap: 01:14.913)
+
+    Comparison: Red Bull Racing had better overall performance with a lower average lap time and better finishing positions, while Mercedes showed slightly better consistency.
+
+    Write your response focusing specifically on the requested team comparison.
+    """
+
+        # Check if this is a driver performance query
+        elif query_analysis.get("query_type") == "driver_performance" and "driver_performance" in filtered_tool_results:
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about a specific driver's performance. Focus ONLY on that driver's performance data.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Driver Performance Data:
+    {json.dumps(filtered_tool_results.get("driver_performance", {}), indent=2)}
+
+    DRIVER PERFORMANCE RESPONSE REQUIREMENTS:
+    1. Focus ONLY on the specific driver's performance that was requested
+    2. Include their total laps, average lap time, best lap time, and consistency
+    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
+    4. Mention their team and any notable aspects of their performance
+    5. Do NOT mention other drivers unless specifically relevant to the requested driver's performance
+    6. Keep the response focused and concise
+
+    FORMATTING FOR DRIVER PERFORMANCE:
+    - Start with the driver's name and team
+    - Include their total laps completed
+    - Show their best lap time and average lap time in MM:SS.mmm format
+    - Mention consistency if notable
+    - Keep it factual and focused on the requested driver
+
+    Example format:
+    Max Verstappen (Red Bull Racing) completed 78 laps in the Monaco Grand Prix 2025 Race. His best lap was 01:14.230 and his average lap time was 01:17.962. He showed good consistency with a standard deviation of 6.904 seconds across all his laps.
+
+    Write your response focusing specifically on the requested driver's performance.
+    """
+        elif query_analysis.get("query_type") == "tire_strategy" and "tire_strategy" in filtered_tool_results:
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about tire strategy analysis. Focus on the tire strategy data and stint information.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Tire Strategy Data:
+    {json.dumps(filtered_tool_results.get("tire_strategy", {}), indent=2)}
+
+    TIRE STRATEGY RESPONSE REQUIREMENTS:
+    1. Focus on tire compound usage, stint lengths, and strategy decisions
+    2. Include information about tire compounds used (Soft, Medium, Hard)
+    3. Mention stint durations and any notable tire management
+    4. If specific teams/drivers were requested, focus on their tire strategy
+    5. Include any pit stop timing related to tire changes
+    6. Keep the response focused and concise
+
+    FORMATTING FOR TIRE STRATEGY:
+    - Start with an overview of tire strategy for the session
+    - Include information about compounds used and stint lengths
+    - If comparing teams/drivers, show their tire strategy side by side
+    - Mention any notable tire management or strategy decisions
+    - Keep it factual and focused on tire strategy
+
+    Example format:
+    For the Monaco Grand Prix 2025 Race, the tire strategy involved primarily Medium and Hard compounds. Most drivers opted for a two-stop strategy, with the first stint averaging 25 laps on Medium tires.
+
+    Write your response focusing specifically on tire strategy and compound usage.
+    """
+        
+        elif query_analysis.get("query_type") == "pit_strategy" and "pit_stop_analysis" in filtered_tool_results:
+            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about pit stop strategy analysis. Focus on the pit stop data and strategy insights.
+
+        User Query: {user_query}
+        Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+        Session: {query_analysis["session_type"]}
+
+        Pit Stop Analysis Data:
+        {json.dumps(filtered_tool_results.get("pit_stop_analysis", {}), indent=2)}
+
+        PIT STRATEGY RESPONSE REQUIREMENTS:
+        1. Focus on pit stop timing, frequency, and strategy
+        2. Include total pit stops, average pit stop duration, and fastest pit stops
+        3. Convert times from seconds to MM:SS.mmm format (e.g., 2.5 seconds becomes 00:02.500)
+        4. Mention any notable pit stop strategies or timing decisions
+        5. If specific teams/drivers were requested, focus on their pit stop performance
+        6. Keep the response focused and concise
+
+        FORMATTING FOR PIT STRATEGY:
+        - Start with an overview of pit stop activity
+        - Include total number of pit stops and average duration
+        - Highlight fastest pit stops and any notable strategies
+        - If comparing teams/drivers, show their pit stop performance side by side
+        - Keep it factual and focused on pit stop strategy
+
+        Example format:
+        For the Monaco Grand Prix 2025 Race, there were 15 pit stops with an average duration of 00:02.847 seconds. The fastest pit stop was completed by Red Bull Racing in 00:02.123 seconds.
+
+        Write your response focusing specifically on pit stop strategy and timing.
+        """
+        # Default prompt for other query types
+        else:
+            return f"""{context_prompt}You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary that directly answers the user's question.
+
+    User Query: {user_query}
+    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
+    Session: {query_analysis["session_type"]}
+
+    Data Retrieved:
+    {json.dumps(filtered_tool_results, indent=2)}
+
+    TEXT QUERY RESPONSE REQUIREMENTS:
+    1. Directly answer the user's question in a friendly, conversational tone
+    2. Include specific numbers, times, and positions
+    3. Use clear, factual language but be engaging
+    4. Convert lap times from seconds to MM:SS.mmm format (e.g., 93.614 seconds becomes 01:33.614)
+    5. Mention significant gaps only if noteworthy
+    6. Provide context and insights about the results
+
+    FORMATTING FOR TEXT QUERIES:
+    - Be friendly and conversational while staying factual
+    - Avoid overly dramatic phrases like "thrilling", "spectacular", "vibrant skies", "edge of their seats"
+    - Focus on facts: who, what times, what positions
+    - When displaying lap times, use MM:SS.mmm format
+    - If multiple fastest laps are provided, list them in order as a list with each entry as a new line from fastest to slowest
+    - Use proper line breaks and spacing for readability
+    - Provide additional context and insights when relevant
+
+    IMPORTANT: When displaying lap times, use the format MM:SS.mmm (e.g., 01:33.614, 01:30.000, 01:35.123). Do NOT mix words and numbers for times.
+
+    Example format:
+    For the Australian Grand Prix 2025 Race, here are the fastest lap times:
+
+    1. Charles Leclerc (Ferrari) - 01:24.567
+    2. Carlos Sainz (Ferrari) - 01:24.789
+    3. Esteban Ocon (Alpine) - 01:25.123
+
+    Charles Leclerc set the fastest lap of the session, with his Ferrari teammate Carlos Sainz close behind. The Alpine of Esteban Ocon rounded out the top three, showing strong pace throughout the session.
+
+    Write your response in a direct, professional tone with proper line breaks and formatting.
+    """
+
 
     def _check_for_ambiguous_query(self, user_query: str, query_analysis: Dict[str, Any]) -> Optional[str]:
         """Check if query is ambiguous and needs clarification about capabilities"""
@@ -925,9 +1339,13 @@ class ReasoningEngine(BaseComponent):
         sql_queries = []
         
         try:
-            meeting_info = query_analysis["meeting_info"]
-            session_type = query_analysis["session_type"]
-            query_type = query_analysis["query_type"]  # Add this line
+            # FIX: Safe access to meeting_info
+            meeting_info = query_analysis.get("meeting_info", {})
+            if not meeting_info or not meeting_info.get("name"):
+                return {"error": "No race specified. Please specify which race you're asking about."}
+            
+            session_type = query_analysis.get("session_type", "Race")
+            query_type = query_analysis.get("query_type", "race_results")
             
             # Add debugging here
             self.logger.info(f"🔍 Executing tools for query type: {query_type}")
@@ -973,10 +1391,8 @@ class ReasoningEngine(BaseComponent):
             tool_results["session_info"] = session_result
             
             # Step 3: Execute specific tools based on query type
-            drivers = query_analysis["drivers"]
-            
-            # Extract team names for all query types
-            teams = query_analysis["teams"]
+            drivers = query_analysis.get("drivers", [])
+            teams = query_analysis.get("teams", [])
             
             # Add debugging for team extraction
             self.logger.info(f"�� Extracted teams: {teams}")
@@ -1093,6 +1509,33 @@ class ReasoningEngine(BaseComponent):
                     sql_queries.append({"tool": "get_sector_analysis", "query": tool_results["sector_analysis"]["sql_query"], "params": tool_results["sector_analysis"].get("sql_params", {})})
             
             elif query_type == "comparison":
+                # Check if we have teams but no drivers (need to look up team drivers)
+                if teams and not drivers:
+                    self.logger.info(f"�� Found teams but no drivers, looking up team drivers")
+                    
+                    # Get drivers for each team
+                    all_drivers = []
+                    for team in teams:
+                        team_drivers_result = self.http_client.call_tool("get_team_drivers", {
+                            "session_key": session_key,
+                            "team_name": team
+                        })
+                        
+                        if team_drivers_result.get("success"):
+                            self.logger.info(f"🔍 Team drivers result: {team_drivers_result}")
+                            team_drivers = team_drivers_result.get("drivers", [])
+                            self.logger.info(f" Team drivers data: {team_drivers}")
+                            driver_names = [driver["full_name"] for driver in team_drivers]
+                            all_drivers.extend(driver_names)
+                            self.logger.info(f"🔍 Found drivers for {team}: {driver_names}")
+                        else:
+                            self.logger.warning(f"🔍 Failed to get drivers for team {team}")
+                    
+                    # Update the drivers list
+                    if all_drivers:
+                        drivers = all_drivers
+                        self.logger.info(f"🔍 Updated drivers list: {drivers}")
+                
                 # Check if it's a team comparison
                 if len(teams) >= 2:
                     # Pass all teams to the tool

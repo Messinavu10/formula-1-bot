@@ -4,7 +4,7 @@ from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.components.mcp_tools import (
     GetMeetingKeyTool, GetSessionKeyTool, GetDriverPerformanceTool, GetTeamPerformanceTool, CompareDriversTool,CompareTeamsTool, GetRaceResultsTool,
     GetQualifyingResultsTool, GetPitStopAnalysisTool, GetTireStrategyTool, InvestigateIncidentTool, GetPositionProgressionTool, GetSectorAnalysisTool,
-    GetSessionInfoTool, ExploreSchemaTool, GetFastestLapTool
+    GetSessionInfoTool, ExploreSchemaTool, GetFastestLapTool, GetTeamDriversTool
 )
 from src.formula_one.components.mcp_visualization_tools import (
     CreateLapTimeProgressionTool, CreatePositionProgressionTool, 
@@ -65,7 +65,8 @@ class MCPTrainingPipeline:
             "create_position_progression": CreatePositionProgressionTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "create_sector_analysis": CreateSectorAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "create_pit_stop_analysis": CreatePitStopAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
-            "create_tire_strategy": CreateTireStrategyTool(self.config, self.db_config, self.db_utils, self.query_builder)
+            "create_tire_strategy": CreateTireStrategyTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "get_team_drivers": GetTeamDriversTool(self.config, self.db_config, self.db_utils, self.query_builder)
         }
         
         # Initialize server
@@ -125,25 +126,43 @@ class MCPTrainingPipeline:
         self.logger.info("Starting MCP server...")
         self.server.run_server_in_thread()
     
-    def test_reasoning_engine(self, user_query: str) -> str:
+    # def test_reasoning_engine(self, user_query: str) -> str:
+    #     """Test the reasoning engine with a user query"""
+    #     try:
+    #         # Clear any previous visualization data
+    #         self.last_visualization = None
+            
+    #         # Get response from reasoning engine
+    #         result = self.reasoning_engine.reason_and_answer(user_query)
+            
+    #         # Handle the response (it might be a tuple now)
+    #         if isinstance(result, tuple):
+    #             response, visualization_data = result
+    #             if visualization_data and visualization_data.get("success"):
+    #                 self.last_visualization = visualization_data
+    #             return response
+    #         else:
+    #             # Backward compatibility for when reason_and_answer returns just a string
+    #             return result
+            
+    #     except Exception as e:
+    #         self.logger.error(f"Error in test_reasoning_engine: {e}")
+    #         return f"I apologize, but I encountered an error: {str(e)}"
+        
+    def test_reasoning_engine(self, user_query: str) -> tuple:
         """Test the reasoning engine with a user query"""
         try:
-            # Clear any previous visualization data
-            self.last_visualization = None
-            
             # Get response from reasoning engine
             result = self.reasoning_engine.reason_and_answer(user_query)
             
             # Handle the response (it might be a tuple now)
             if isinstance(result, tuple):
                 response, visualization_data = result
-                if visualization_data and visualization_data.get("success"):
-                    self.last_visualization = visualization_data
-                return response
+                return response, visualization_data
             else:
                 # Backward compatibility for when reason_and_answer returns just a string
-                return result
+                return result, None
             
         except Exception as e:
             self.logger.error(f"Error in test_reasoning_engine: {e}")
-            return f"I apologize, but I encountered an error: {str(e)}"
+            return f"I apologize, but I encountered an error: {str(e)}", None

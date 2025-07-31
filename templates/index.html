@@ -497,7 +497,7 @@
           <div class="message-content">
             <div class="welcome-message">
               <h2>Welcome to F1Bot!</h2>
-              <p>Your AI-powered Formula 1 data assistant.<br>Try these sample queries to get started:</p>
+              <p>Your AI-powered Formula 1 data bot.<br>Try these sample queries to get started:</p>
               <div class="sample-queries">
                 <code>Who won the Monaco Grand Prix?</code>
                 <code>Show me the pit stop analysis for Bahrain</code>
@@ -542,6 +542,7 @@
     </div>
 
     <script>
+        
         class F1Chatbot {
             constructor() {
                 this.chatMessages = document.getElementById('chat-messages');
@@ -554,6 +555,7 @@
                 this.themeIcon = document.getElementById('theme-icon');
                 this.themeText = document.getElementById('theme-text');
                 this.isProcessing = false;
+                this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
                 
                 // Initialize the chatbot
                 this.init();
@@ -681,32 +683,33 @@
             }
 
             async sendRequest(message) {
-                console.log('sendRequest called with:', message); // Debug log
                 try {
                     const response = await fetch('/api/chat', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({ message: message })
+                        body: JSON.stringify({
+                            message: message,
+                            session_id: this.sessionId  // Add this line
+                        })
                     });
 
                     const data = await response.json();
-                    console.log('Response received:', data); // Debug log
 
                     if (data.error) {
-                        this.addMessage(`❌ ${data.error}`, 'bot');
+                        this.addMessage(`Error: ${data.error}`, 'bot');
                     } else {
                         this.addMessage(data.response, 'bot');
                         
                         // Handle visualization if present
-                        if (data.visualization) {
+                        if (data.visualization && data.visualization.success) {
                             this.displayVisualization(data.visualization);
                         }
                     }
                 } catch (error) {
-                    console.error('Error in sendRequest:', error); // Debug log
-                    this.addMessage('❌ Sorry, I encountered an error. Please try again.', 'bot');
+                    console.error('Error:', error);
+                    this.addMessage('Sorry, I encountered an error. Please try again.', 'bot');
                 } finally {
                     this.hideTypingIndicator();
                 }
@@ -765,12 +768,15 @@
 
             addMessage(content, sender) {
                 const messageDiv = document.createElement('div');
-                messageDiv.className = `message ${sender}`;
+                
+                // Normalize sender type
+                const normalizedSender = sender === 'assistant' ? 'bot' : sender;
+                messageDiv.className = `message ${normalizedSender}`;
                 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-content';
                 
-                if (sender === 'bot') {
+                if (normalizedSender === 'bot') {
                     // Convert markdown-style formatting to HTML
                     let formattedContent = content
                         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')  // **bold** to <strong>

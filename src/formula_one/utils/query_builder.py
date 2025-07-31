@@ -118,6 +118,20 @@ class QueryBuilder:
         GROUP BY d.full_name, d.team_name, s.session_name
         """
 
+
+    def build_team_drivers_query(self, session_key, team_name):
+        """Build query to get all drivers for a team in a session"""
+        return """
+        SELECT DISTINCT
+            d.full_name,
+            d.team_name,
+            d.driver_number
+        FROM drivers_transformed d
+        WHERE d.session_key = :session_key
+        AND d.team_name ILIKE :team_name_pattern
+        ORDER BY d.full_name
+        """
+
     def build_driver_comparison_query(self, session_key, drivers, comparison_metrics=["all"]):
         """Build query to compare performance between multiple drivers"""
         
@@ -412,7 +426,7 @@ class QueryBuilder:
         WITH team_summary AS (
             SELECT 
                 d.team_name,
-                COUNT(DISTINCT l.driver_number || '-' || l.lap_number) AS total_laps,
+                COUNT(DISTINCT l.lap_number) AS total_laps,
                 ROUND(AVG(l.lap_duration)::numeric, 3) AS avg_lap,
                 MIN(l.lap_duration) AS best_lap,
                 ROUND(STDDEV(l.lap_duration)::numeric, 3) AS consistency
@@ -498,7 +512,7 @@ class QueryBuilder:
                 'team' AS level,
                 d.team_name,
                 NULL AS full_name,
-                COUNT(DISTINCT l.driver_number || '-' || l.lap_number) AS total_laps,
+                COUNT(DISTINCT l.lap_number) AS total_laps,
                 ROUND(AVG(l.lap_duration)::numeric, 3) AS avg_lap,
                 MIN(l.lap_duration) AS best_lap,
                 ROUND(STDDEV(l.lap_duration)::numeric, 3) AS consistency,
