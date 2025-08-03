@@ -4,7 +4,6 @@ import json
 
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.config_entity import DatabaseConfig
-from src.formula_one.components.advanced_memory import VectorMemoryManager
 
 class EnhancedContextManager(BaseComponent):
     """Enhanced context manager with vector memory integration"""
@@ -12,10 +11,7 @@ class EnhancedContextManager(BaseComponent):
     def __init__(self, config, db_config: DatabaseConfig):
         super().__init__(config, db_config)
         
-        # Initialize vector memory manager
-        self.vector_memory = VectorMemoryManager(config, db_config)
-        
-        # Legacy conversation history (for backward compatibility)
+        # Conversation history
         self.conversation_history = []
         self.last_clarification_context = None
         self.last_meeting_context = None
@@ -23,8 +19,7 @@ class EnhancedContextManager(BaseComponent):
         self.logger.info("🧠 Enhanced Context Manager initialized")
     
     def add_to_history(self, message: str, response: str, query_analysis: Dict[str, Any] = None):
-        """Add to conversation history with vector memory"""
-        # Legacy history (for backward compatibility)
+        """Add to conversation history"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "message": message,
@@ -32,47 +27,17 @@ class EnhancedContextManager(BaseComponent):
         }
         self.conversation_history.append(entry)
         
-        # Always store in vector memory (create basic analysis if not provided)
-        if query_analysis is None:
-            # Create basic query analysis for vector storage
-            query_analysis = {
-                "query_type": "general",
-                "meeting_info": {"name": None, "year": 2025},
-                "session_type": "Race",
-                "drivers": [],
-                "teams": []
-            }
-        
-        self.vector_memory.store_exchange(message, response, query_analysis)
-        
-        self.logger.info(f"🔍 Added to enhanced history: {entry}")
+        self.logger.info(f"🔍 Added to history: {entry}")
     
     def get_enhanced_context(self, user_query: str, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Get enhanced context using vector memory"""
-        try:
-            # Check for topic change
-            if self.vector_memory.detect_topic_change(query_analysis):
-                self.vector_memory.clear_context_for_new_topic()
-            
-            # Retrieve relevant context
-            context = self.vector_memory.retrieve_relevant_context(user_query, query_analysis)
-            
-            # Add legacy context for backward compatibility
-            context["legacy_history"] = self.conversation_history[-3:] if self.conversation_history else []
-            
-            self.logger.info(f"�� Retrieved enhanced context: {len(context.get('relevant_exchanges', []))} exchanges")
-            
-            return context
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error getting enhanced context: {e}")
-            # Fallback to legacy context
-            return {
-                "legacy_history": self.conversation_history[-3:] if self.conversation_history else [],
-                "conversation_summary": {},
-                "entity_memory": {},
-                "context_cache": []
-            }
+        """Get conversation context"""
+        # Return recent conversation history
+        return {
+            "legacy_history": self.conversation_history[-3:] if self.conversation_history else [],
+            "conversation_summary": {},
+            "entity_memory": {},
+            "context_cache": []
+        }
     
     def generate_context_prompt(self, context: Dict[str, Any]) -> str:
         """Generate a context prompt for the LLM"""
@@ -114,38 +79,44 @@ class EnhancedContextManager(BaseComponent):
         if not self.conversation_history:
             return False
         
+        # Don't treat very short queries as clarifications
+        if len(user_query.strip()) <= 3:
+            return False
+        
         last_response = self.conversation_history[-1]["response"]
         
+        # More specific clarification patterns that clearly indicate a request for clarification
         clarification_patterns = [
-            # Visualization/text clarification patterns
+            # Race clarification patterns - very specific
+            "Could you please specify which race",
+            "Could you please specify the race",
+            "which race you're asking about",
+            "which race you're referring to",
+            "specify which race",
+            "specify the race",
+            "please specify which race",
+            "please specify the race",
+            "which race",
+            "referring to",
+            
+            # Visualization/text clarification patterns - very specific
             "Would you like me to create a visualization chart",
             "Would you prefer a text summary",
             "Would you like a visualization chart or a text summary",
-            "I can help you with that! Would you like me to create",
-            "Would you like a visualization or a text summary",
-            
-            # Race clarification patterns (FIXED)
-            "I couldn't identify which race",
-            "Could you please specify the race",
-            "Could you please specify which race",  # ADD THIS
-            "which race you're asking about",
-            "which race you're referring to",      # ADD THIS
-            "specify which race",                  # ADD THIS
-            "specify the race",
-            "Bahrain Grand Prix", "Miami Grand Prix", "Chinese Grand Prix",
-            "Could you please specify",
-            "I couldn't identify which",
-            "please specify which race",           # ADD THIS
-            "please specify the race",             # ADD THIS
-            "which race",                         # ADD THIS
-            "specify the race",                   # ADD THIS
-            "referring to"                        # ADD THIS
+            "Would you like a visualization or a text summary"
         ]
 
         is_clarification = any(pattern in last_response for pattern in clarification_patterns)
         self.logger.info(f"🔍 Checking clarification response for: '{user_query}'")
         self.logger.info(f"🔍 Last response: '{last_response[:100]}...'")
         self.logger.info(f"🔍 Is clarification response: {is_clarification}")
+        
+        # Debug: show which pattern matched
+        if is_clarification:
+            for pattern in clarification_patterns:
+                if pattern in last_response:
+                    self.logger.info(f"🔍 Matched clarification pattern: '{pattern}'")
+                    break
         
         return is_clarification
     

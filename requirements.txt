@@ -9,7 +9,6 @@ ensure
 psycopg2-binary
 sqlalchemy
 scikit-learn
-sentence-transformers
 spacy
 matplotlib
 seaborn

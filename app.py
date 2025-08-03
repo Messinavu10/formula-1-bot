@@ -111,7 +111,9 @@ async def chat_endpoint(request: Request):
         
         # Add debug logging for visualization data
         if visualization_data:
-            print(f" Visualization data: {visualization_data}")
+            print(f"🔍 Visualization data: {visualization_data}")
+            print(f"🔍 Visualization filename: {visualization_data.get('filename', 'N/A')}")
+            print(f"🔍 Visualization success: {visualization_data.get('success', False)}")
         
         return {
             "response": response,

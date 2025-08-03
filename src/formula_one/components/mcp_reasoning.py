@@ -6,12 +6,14 @@ from langchain.schema import HumanMessage, SystemMessage
 import json
 import time
 import os
-import numpy as np
+import asyncio
+import inspect
+import concurrent.futures
 
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.entity.mcp_config_entity import MCPConfig
-from sentence_transformers import SentenceTransformer
+from src.formula_one.utils.validation_utils import QueryValidator, ValidationResult
 
 from src.formula_one.components.enhanced_context_memory import EnhancedContextManager
 
@@ -21,10 +23,17 @@ class IntentAnalyzer(BaseComponent):
     
     def __init__(self, config, db_config: DatabaseConfig):
         super().__init__(config, db_config)
-
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Define intent patterns with examples
+        # Initialize LLM for intent classification
+        api_key = config.openai_api_key or os.getenv('OPENAI_API_KEY')
+        self.intent_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1,  # Lower temperature for more consistent classification
+            openai_api_key=api_key,
+            max_tokens=500
+        )
+        
+        # Define intent patterns for keyword matching
         self.intent_patterns = {
             "comparison": [
                 "compare", "vs", "versus", "difference", "who was better",
@@ -79,11 +88,6 @@ class IntentAnalyzer(BaseComponent):
                 "show me"
             ]
         }
-        
-        # Pre-compute embeddings for all patterns
-        self.pattern_embeddings = {}
-        for intent, patterns in self.intent_patterns.items():
-            self.pattern_embeddings[intent] = self.model.encode(patterns)
 
     def analyze_query_intent(self, user_query: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
         """Analyze user query to determine intent and extract relevant information"""
@@ -99,78 +103,101 @@ class IntentAnalyzer(BaseComponent):
         # Determine session type
         session_type = self._determine_session_type(query_lower)
         
-        # Check if this is a generic query that should inherit from conversation history
-        generic_queries = ["summary", "show me", "tell me", "what about", "and", "also"]
-        should_inherit = any(generic in query_lower for generic in generic_queries)
+        # Use LLM for enhanced intent classification
+        llm_intent = self._classify_intent_with_llm(user_query, conversation_history)
         
-        self.logger.info(f"🔍 Should inherit: {should_inherit}")
-        self.logger.info(f"🔍 Conversation history: {conversation_history}")
+        # Fallback to rule-based classification if LLM fails
+        if not llm_intent:
+            llm_intent = self._determine_query_type(query_lower)
         
-        if should_inherit and conversation_history:
-            # Look for specific query types in recent conversation history
-            for i, entry in enumerate(reversed(conversation_history[-3:])):
-                self.logger.info(f"🔍 Checking history entry {i}: {entry}")
-                previous_query_type = self._determine_query_type(entry["message"].lower())
-                self.logger.info(f"🔍 Previous query type: {previous_query_type}")
-                if previous_query_type in ["tire_strategy", "pit_strategy", "sector_analysis", "comparison", "position_analysis"]:
-                    self.logger.info(f"🔍 Using query type from conversation history: {previous_query_type}")
-                    query_type = previous_query_type
-                    break
-            else:
-                # If no specific query type found in history, determine normally
-                self.logger.info(f"🔍 No specific query type found in history, determining normally")
-                query_type = self._determine_query_type(query_lower)
-        else:
-            # Determine query type normally
-            self.logger.info(f"🔍 Determining query type normally")
-            query_type = self._determine_query_type(query_lower)
+        # Add debug logging for pit stop analysis
+        if "pit stop" in user_query.lower():
+            self.logger.info(f"🔍 Pit stop query detected - LLM intent: {llm_intent}")
+            self.logger.info(f"🔍 Rule-based intent would be: {self._determine_query_type(user_query.lower())}")
         
-        # Add debugging
-        self.logger.info(f"🔍 Query type determined: {query_type}")
-        
-        # Extract driver names from current query
+        # Extract entities
         drivers = self._extract_driver_names(user_query)
-        
-        # Extract team names from current query
         teams = self._extract_team_names(user_query)
-        
-        # If no teams/drivers found in current query, try to get from conversation history
-        if not teams and not drivers and conversation_history:
-            # Look for teams/drivers in recent conversation history
-            for entry in reversed(conversation_history[-3:]):
-                previous_teams = self._extract_team_names(entry["message"])
-                previous_drivers = self._extract_driver_names(entry["message"])
-                
-                if previous_teams:
-                    self.logger.info(f"🔍 Using teams from conversation history: {previous_teams}")
-                    teams = previous_teams
-                    break
-                elif previous_drivers:
-                    self.logger.info(f"�� Using drivers from conversation history: {previous_drivers}")
-                    drivers = previous_drivers
-                    break
-        
-        # Extract lap number if present
         lap_number = self._extract_lap_number(user_query)
         
-        # Get context from conversation history
-        context = self._get_context_from_history(conversation_history)
+        # Get context from history
+        context = self._get_context_from_history(conversation_history) if conversation_history else {}
         
-        # Combine all analysis results
-        analysis_result = {
-            "query_type": query_type,
+        return {
+            "query_type": llm_intent,
             "meeting_info": meeting_info,
             "session_type": session_type,
             "drivers": drivers,
             "teams": teams,
             "lap_number": lap_number,
-            "context": context
+            "context": context,
+            "original_query": user_query
         }
+
+    def _classify_intent_with_llm(self, user_query: str, conversation_history: List[Dict] = None) -> str:
+        """Use LLM to classify user intent more accurately"""
         
-        # Add debugging
-        self.logger.info(f"�� Analysis result: {analysis_result}")
-    
-        return analysis_result
+        # Skip LLM classification for very short queries to avoid meta-commentary
+        if len(user_query.strip()) <= 3:
+            self.logger.info(f"🔍 Skipping LLM classification for short query: '{user_query}'")
+            return None
+        
+        # Build context from conversation history
+        context_prompt = ""
+        if conversation_history:
+            recent_context = conversation_history[-3:]  # Last 3 exchanges
+            context_prompt = f"\nRecent conversation context:\n"
+            for exchange in recent_context:
+                context_prompt += f"User: {exchange.get('query', '')}\n"
+                context_prompt += f"Assistant: {exchange.get('response', '')[:100]}...\n"
+        
+        classification_prompt = f"""You are an expert F1 data analyst. Classify the user's intent from the following query.
+
+Available intent types:
+- comparison: Comparing drivers, teams, or performance metrics
+- driver_performance: Individual driver analysis and statistics
+- team_performance: Team-level analysis and statistics
+- fastest_lap: Best lap times and fastest laps
+- sector_analysis: Sector-by-sector performance analysis
+- tire_strategy: Tire compound usage and strategy
+- pit_strategy: Pit stop timing and strategy
+- incident_investigation: Accidents, incidents, or unusual events
+- qualifying_results: Qualifying session results and grid positions
+- race_results: Race outcomes and finishing positions
+- visualization: Requests for charts, graphs, or visual data
+- position_analysis: Position progression and race position analysis
+- lap_time_progression: Lap time trends and progression
+
+{context_prompt}
+
+User Query: "{user_query}"
+
+Instructions:
+1. Analyze the user's intent carefully
+2. Consider context from recent conversation
+3. Return ONLY the intent type (e.g., "comparison", "driver_performance", etc.)
+4. If unclear, choose the most likely intent based on keywords and context
+
+Intent:"""
+
+        try:
+            response = self.intent_llm.invoke(classification_prompt)
+            intent = response.content.strip().lower()
+            
+            # Validate the intent
+            valid_intents = list(self.intent_patterns.keys()) + ["position_analysis", "lap_time_progression"]
+            if intent in valid_intents:
+                self.logger.info(f"🔍 LLM classified intent as: {intent}")
+                return intent
+            else:
+                self.logger.warning(f"🔍 LLM returned invalid intent: {intent}, falling back to rule-based")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in LLM intent classification: {e}")
+            return None
+
+
     
     def _extract_lap_number(self, query: str) -> Optional[int]:
         """Extract lap number from query"""
@@ -197,8 +224,10 @@ class IntentAnalyzer(BaseComponent):
         return None
     
     def _extract_meeting_info(self, query: str) -> Dict[str, Any]:
-        """Extract meeting name and year from query"""
-        race_keywords = {
+        """Extract meeting name and year from query with intelligent abbreviation handling"""
+        
+        # Base race mappings (without abbreviations)
+        race_mappings = {
             'australian': 'Australian Grand Prix',
             'chinese': 'Chinese Grand Prix',
             'china': 'Chinese Grand Prix',
@@ -222,17 +251,42 @@ class IntentAnalyzer(BaseComponent):
             'british': 'British Grand Prix',
             'silverstone': 'British Grand Prix',
             'great britain': 'British Grand Prix',
-            'belgian' : 'Belgian Grand Prix',
-            'spa' : 'Belgian Grand Prix'
+            'belgian': 'Belgian Grand Prix',
+            'spa': 'Belgian Grand Prix'
         }
         
         query_lower = query.lower()
         meeting_name = None
         
-        for keyword, race_name in race_keywords.items():
+        # First, try exact matches from the base mappings
+        for keyword, race_name in race_mappings.items():
             if keyword in query_lower:
                 meeting_name = race_name
                 break
+        
+        # If no exact match found, try intelligent abbreviation handling
+        if not meeting_name:
+            # Look for patterns like "monaco gp", "austrian gp", etc.
+            
+            # Pattern to match: word + "gp" or "grand prix"
+            gp_patterns = [
+                r'(\w+)\s+(?:gp|grand\s+prix)',
+                r'(?:gp|grand\s+prix)\s+(\w+)'
+            ]
+            
+            for pattern in gp_patterns:
+                matches = re.findall(pattern, query_lower)
+                for match in matches:
+                    # Try to map the base word to a race
+                    base_word = match.strip()
+                    for keyword, race_name in race_mappings.items():
+                        if base_word in keyword or keyword in base_word:
+                            meeting_name = race_name
+                            break
+                    if meeting_name:
+                        break
+                if meeting_name:
+                    break
         
         # Extract year (default to 2025)
         year_match = re.search(r'20\d{2}', query)
@@ -277,39 +331,67 @@ class IntentAnalyzer(BaseComponent):
     def _extract_team_names(self, query: str) -> List[str]:
         """Extract team names from query"""
         team_mappings = {
-            "mercedes": "Mercedes",
-            "ferrari": "Ferrari", 
-            "mclaren": "McLaren",
-            "red bull": "Red Bull Racing",
-            "redbull": "Red Bull Racing",
-            "red bull racing": "Red Bull Racing",
-            "williams": "Williams",
-            "alpine": "Alpine",
-            "aston martin": "Aston Martin",
-            "astonmartin": "Aston Martin",
-            "haas": "Haas F1 Team",
-            "haas f1": "Haas F1 Team",
-            "rb": "Racing Bulls",
-            "bulls": "Racing Bulls",
-            "racing bulls": "Racing Bulls",
-            "sauber": "Sauber",
-            "stake": "Stake F1 Team",
-            "stake f1": "Stake F1 Team"
+            "Mercedes": ["mercedes", "mercedes team", "mercedes amg"],
+            "Ferrari": ["ferrari", "ferrari team", "scuderia ferrari"],
+            "Red Bull Racing": ["red bull", "red bull racing", "red bull team", "redbull"],
+            "McLaren": ["mclaren", "mclaren team", "mclaren racing"],
+            "Aston Martin": ["aston martin", "aston martin team", "aston"],
+            "Alpine": ["alpine", "alpine team", "alpine racing"],
+            "Williams": ["williams", "williams team", "williams racing"],
+            "AlphaTauri": ["alphatauri", "alpha tauri", "alpha tauri team"],
+            "Alfa Romeo": ["alfa romeo", "alfa", "alfa romeo team"],
+            "Haas": ["haas", "haas team", "haas f1"],
+            "Sauber": ["sauber", "sauber team", "sauber racing"],
+            "Racing Bulls": ["racing bulls", "racing bulls team", "bulls"]
         }
         
         query_lower = query.lower()
         found_teams = []
         
-        # Add debugging
-        self.logger.info(f"🔍 Extracting teams from: '{query_lower}'")
+        # First, try to find valid teams
+        for full_name, aliases in team_mappings.items():
+            for alias in aliases:
+                if alias in query_lower:
+                    if full_name not in found_teams:
+                        found_teams.append(full_name)
+                    break
         
-        for team_alias, team_name in team_mappings.items():
-            if team_alias in query_lower:
-                self.logger.info(f"✅ Found team alias '{team_alias}' -> '{team_name}'")
-                if team_name not in found_teams:
-                    found_teams.append(team_name)
+        # If no valid teams found, look for potential invalid team names
+        if not found_teams:
+            # Look for patterns that suggest a team name was mentioned
+            import re
+            
+            # First, get valid driver names to avoid false positives
+            valid_driver_names = [
+                "max verstappen", "lewis hamilton", "charles leclerc", "lando norris",
+                "oscar piastri", "george russell", "fernando alonso", "carlos sainz",
+                "pierre gasly", "yuki tsunoda", "alex albon", "lance stroll",
+                "esteban ocon", "nico hulkenberg", "liam lawson", "oliver bearman",
+                "gabriel bortoleto", "isack hadjar", "jack doohan", "franco colapinto",
+                "andrea kimi antonelli"
+            ]
+            
+            # More specific patterns that clearly indicate a team name
+            team_patterns = [
+                r'team\s+([A-Za-z]+\s+[A-Za-z]+)',      # "team Red Bull"
+                r'team\s+([A-Za-z]+)',                   # "team Red"
+            ]
+            
+            for pattern in team_patterns:
+                matches = re.findall(pattern, query_lower)
+                for match in matches:
+                    # Check if this looks like a team name but isn't in our valid list
+                    potential_team = match.strip().lower()
+                    if potential_team and len(potential_team) > 2:  # At least 3 characters
+                        # Check if it's not a common word that might be part of the query
+                        common_words = ['the', 'and', 'for', 'at', 'in', 'on', 'with', 'from', 'to', 'of', 'a', 'an', 'time', 'lap', 'progression', 'analysis', 'performance', 'strategy', 'pit', 'stop', 'tire', 'tyre', 'sector', 'position', 'qualifying', 'practice', 'race', 'sprint', 'grand', 'prix', 'gp']
+                        if potential_team not in common_words and potential_team not in valid_driver_names:
+                            # Only flag if it looks like a proper team name (contains uppercase or is clearly a name)
+                            if any(word[0].isupper() for word in match.split()) or len(match.split()) >= 2:
+                                # This looks like an invalid team name
+                                found_teams.append(match.title())
+                                break
         
-        self.logger.info(f"🔍 Final extracted teams: {found_teams}")
         return found_teams
 
     def _determine_query_type(self, query_lower: str) -> str:
@@ -326,7 +408,7 @@ class IntentAnalyzer(BaseComponent):
             "plot the data", "graph the results", "show me the progression",
             "visualize the data", "create a diagram", "show me the analysis",
             "show me", "sector chart", "position chart", "lap chart", "tire chart",
-            "pit stop chart", "strategy chart"
+            "pit stop chart", "strategy chart", "create a", "show me a"
         ]
         
         for keyword in viz_keywords:
@@ -334,28 +416,85 @@ class IntentAnalyzer(BaseComponent):
                 self.logger.info(f"✅ Matched visualization keyword: '{keyword}'")
                 return "visualization"
         
+        # Check for lap time progression keywords
+        lap_time_keywords = [
+            "lap time progression", "lap times", "lap time", "lap analysis",
+            "lap comparison", "lap performance", "lap time chart", "lap time analysis",
+            "lap time tracking", "lap time development", "lap time evolution"
+        ]
+        for keyword in lap_time_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched lap time progression keyword: '{keyword}'")
+                return "lap_time_progression"
+        
         position_progression_keywords = [
-        "position progression", "position changes", "position analysis",
-        "how did positions change", "position tracking", "position movement",
-        "position development", "position evolution", "position history"
+            "position progression", "position changes", "position analysis",
+            "how did positions change", "position tracking", "position movement",
+            "position development", "position evolution", "position history",
+            "position chart", "position analysis"
         ]
         for keyword in position_progression_keywords:
             if keyword in query_lower:
                 self.logger.info(f"✅ Matched position progression keyword: '{keyword}'")
                 return "position_analysis"
             
-        # Second, check for tire strategy keywords (HIGHER PRIORITY than comparison)
+        # Check for tire strategy keywords (HIGHER PRIORITY than comparison)
         tire_strategy_keywords = [
             "tire strategy", "tire strategies", "tire compound", "tire compounds",
             "tire usage", "tire management", "tire performance", "tire analysis",
             "compound strategy", "compound usage", "compound management",
             "stint", "stints", "stint length", "stint duration",
-            "tire comparison", "tire strategy comparison", "compound comparison"
+            "tire comparison", "tire strategy comparison", "compound comparison",
+            "tire compounds used", "tire strategy for"
         ]
         for keyword in tire_strategy_keywords:
             if keyword in query_lower:
                 self.logger.info(f"✅ Matched tire strategy keyword: '{keyword}'")
                 return "tire_strategy"
+        
+        # Check for pit stop keywords
+        pit_stop_keywords = [
+            "pit stop", "pitstop", "pitted", "when did they pit", "pit strategy",
+            "pit stops", "pitstop", "when did", "pit timing", "pit duration",
+            "pit stop analysis", "pit stop strategy", "pit stop timing",
+            "when drivers pitted", "pit stop times", "pit stop performance",
+            "pit stop comparison", "pit stop for"
+        ]
+        for keyword in pit_stop_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched pit stop keyword: '{keyword}'")
+                return "pit_strategy"
+        
+        # Check for fastest lap keywords
+        fastest_lap_keywords = [
+            "fastest lap", "best lap", "quickest lap", "fastest lap time",
+            "best lap time", "quickest lap time", "fastest lap for",
+            "what was the fastest", "fastest lap at"
+        ]
+        for keyword in fastest_lap_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched fastest lap keyword: '{keyword}'")
+                return "fastest_lap"
+        
+        # Check for qualifying results keywords
+        qualifying_keywords = [
+            "qualifying results", "qualifying positions", "qualifying outcome",
+            "qualifying for", "qualifying at", "qualifying performance"
+        ]
+        for keyword in qualifying_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched qualifying keyword: '{keyword}'")
+                return "qualifying_results"
+        
+        # Check for race results keywords
+        race_results_keywords = [
+            "race results", "final positions", "race outcome", "race for",
+            "race at", "final results", "race positions", "race finish"
+        ]
+        for keyword in race_results_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched race results keyword: '{keyword}'")
+                return "race_results"
         
         # Second, check for explicit comparison keywords (HIGHER PRIORITY)
         comparison_keywords = ["compare", "vs", "versus", "difference", "who was better", "which driver was faster", "comparison"]
@@ -370,18 +509,6 @@ class IntentAnalyzer(BaseComponent):
             return "sector_analysis"
         
         self.logger.info(f"🔍 No comparison keywords matched")
-        
-        # Third, check for pit stop keywords (lower priority)
-        pit_stop_keywords = [
-            "pit stop", "pitstop", "pitted", "when did they pit", "pit strategy",
-            "pit stops", "pitstop", "when did", "pit timing", "pit duration",
-            "pit stop analysis", "pit stop strategy", "pit stop timing",
-            "when drivers pitted", "pit stop times", "pit stop performance"
-        ]
-        for keyword in pit_stop_keywords:
-            if keyword in query_lower:
-                self.logger.info(f"✅ Matched pit stop keyword: '{keyword}'")
-                return "pit_strategy"
         
         # Check for lap-related incident keywords (more flexible)
         lap_incident_keywords = [
@@ -443,36 +570,15 @@ class IntentAnalyzer(BaseComponent):
                 return "team_performance"
         
         # Check for driver performance keywords (LOWER PRIORITY)
-        driver_keywords = ["driver performance", "driver analysis", "driver stats", "driver data"]
+        driver_keywords = ["driver performance", "driver analysis", "driver stats", "driver data", "how did", "performance for"]
         for keyword in driver_keywords:
             if keyword in query_lower:
                 self.logger.info(f"✅ Matched driver performance keyword: '{keyword}'")
                 return "driver_performance"
         
-        # If no explicit keywords, use semantic similarity
-        self.logger.info(f"🔍 No explicit keywords matched, using semantic similarity")
-        query_embedding = self.model.encode([query_lower])
-        
-        best_intent = "race_results"  # default
-        best_score = 0
-        
-        # Compare query with each intent pattern
-        for intent, pattern_embeddings in self.pattern_embeddings.items():
-            # Calculate cosine similarity between query and all patterns for this intent
-            similarities = np.dot(pattern_embeddings, query_embedding.T).flatten()
-            max_similarity = np.max(similarities)
-            
-            if max_similarity > best_score:
-                best_score = max_similarity
-                best_intent = intent
-        
-        # Set a threshold - if no good match, default to race_results
-        if best_score < 0.2:  # Adjust threshold as needed
-            self.logger.info(f"🔍 Low similarity score ({best_score:.3f}), defaulting to race_results")
-            return "race_results"
-
-        self.logger.info(f"✅ Semantic similarity matched: {best_intent} (score: {best_score:.3f})")
-        return best_intent
+        # If no explicit keywords matched, default to race_results
+        self.logger.info(f"🔍 No explicit keywords matched, defaulting to race_results")
+        return "race_results"
 
     
     def _extract_driver_names(self, query: str) -> List[str]:
@@ -503,12 +609,39 @@ class IntentAnalyzer(BaseComponent):
         query_lower = query.lower()
         found_drivers = []
         
+        # First, try to find valid drivers
         for full_name, aliases in driver_mappings.items():
             for alias in aliases:
                 if alias in query_lower:
                     if full_name not in found_drivers:
                         found_drivers.append(full_name)
                     break
+        
+        # If no valid drivers found, look for potential invalid driver names
+        if not found_drivers:
+            # Look for patterns that suggest a driver name was mentioned
+            import re
+            # More specific patterns that clearly indicate a driver name
+            driver_patterns = [
+                r'for\s+([A-Za-z]+\s+[A-Za-z]+)\s+at',  # "for Max Verstappen at"
+                r'driver\s+([A-Za-z]+\s+[A-Za-z]+)',    # "driver Max Verstappen"
+                r'driver\s+([A-Za-z]+)',                 # "driver Max"
+            ]
+            
+            for pattern in driver_patterns:
+                matches = re.findall(pattern, query_lower)
+                for match in matches:
+                    # Check if this looks like a driver name but isn't in our valid list
+                    potential_driver = match.strip()
+                    if potential_driver and len(potential_driver) > 2:  # At least 3 characters
+                        # Check if it's not a common word that might be part of the query
+                        common_words = ['the', 'and', 'for', 'at', 'in', 'on', 'with', 'from', 'to', 'of', 'a', 'an', 'time', 'lap', 'progression', 'analysis', 'performance', 'strategy', 'pit', 'stop', 'tire', 'tyre', 'sector', 'position', 'qualifying', 'practice', 'race', 'sprint', 'grand', 'prix', 'gp']
+                        if potential_driver not in common_words:
+                            # Only flag if it looks like a proper name (contains uppercase or is clearly a name)
+                            if any(word[0].isupper() for word in potential_driver.split()) or len(potential_driver.split()) >= 2:
+                                # This looks like an invalid driver name
+                                found_drivers.append(potential_driver.title())
+                                break
         
         return found_drivers 
 
@@ -533,17 +666,31 @@ class ReasoningEngine(BaseComponent):
         else:
             api_key = config.openai_api_key
         
-        # Initialize LLM
         self.llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             temperature=0.3,
             openai_api_key=api_key
         )
+        
+        # Add reasoning configuration
+        self.reasoning_config = {
+            "enable_chain_of_thought": True,
+            "enable_few_shot_examples": True,
+            "enable_context_awareness": True,
+            "max_reasoning_steps": 5,
+            "confidence_threshold": 0.7
+        }
+        
+        # Initialize query validator
+        self.query_validator = QueryValidator(db_config)
 
-    def reason_and_answer(self, user_query: str) -> str:
+    def reason_and_answer(self, user_query: str) -> tuple:
         """Main reasoning method that analyzes query and generates response"""
         try:
             self.logger.info(f"🧠 Processing query: '{user_query}'")
+            
+            # Initialize query_analysis variable
+            query_analysis = {}
             
             # Get conversation history from context manager
             conversation_history = self.context_manager.conversation_history
@@ -558,59 +705,194 @@ class ReasoningEngine(BaseComponent):
                 self.logger.info(f"🔍 Last response contains clarification patterns: {any(pattern in last_response for pattern in ['Could you please specify', 'I cannot identify'])}")
             
             # Check if this is a clarification response to a previous query
-            if conversation_history and self.context_manager.is_clarification_response(user_query):
+            # Only treat as clarification if the query is not too short and actually looks like a clarification
+            if conversation_history and len(user_query.strip()) > 3 and self.context_manager.is_clarification_response(user_query):
                 self.logger.info(f"🔍 Detected clarification response: {user_query}")
-                
-                # Get the clarification context
-                clarification_context = self.context_manager.get_clarification_context()
-                if clarification_context:
-                    self.logger.info(f"🔍 Found clarification context: {clarification_context}")
-                    
-                    # Extract meeting info from the clarification response
-                    meeting_info = self.intent_analyzer._extract_meeting_info(user_query)
-                    
-                    # Combine the clarification with the original context
-                    combined_query_analysis = {
-                        "query_type": clarification_context.get("query_type", "race_results"),
-                        "meeting_info": meeting_info,
-                        "session_type": clarification_context.get("session_type", "Race"),
-                        "drivers": clarification_context.get("drivers", []),
-                        "teams": clarification_context.get("teams", []),
-                        "lap_number": None,
-                        "context": clarification_context.get("meeting_info", {})
-                    }
-                    
-                    self.logger.info(f"🔍 Combined query analysis: {combined_query_analysis}")
-                    
-                    # Clear the clarification context
-                    self.context_manager.clear_clarification_context()
-                    
-                    # Execute tools with the combined context
-                    tool_results = self._execute_tools_for_query(user_query, combined_query_analysis)
-                    self.logger.info(f"🧠 Tool results for clarification: {tool_results}")
-                    
-                    # Generate response
-                    if "error" in tool_results:
-                        response = f"I apologize, but I encountered an error: {tool_results['error']}"
-                    else:
-                        response = self._generate_intelligent_summary(user_query, combined_query_analysis, tool_results)
-                    
-                    # Add to conversation history with enhanced context
-                    self.context_manager.add_to_history(user_query, response, combined_query_analysis)
-                    
-                    return response, tool_results.get("visualization")
-                else:
-                    self.logger.warning(f"🔍 No clarification context found for: {user_query}")
-            else:
-                self.logger.info(f"🔍 Not a clarification response: {user_query}")
+                self.logger.info(f"🔍 Conversation history length: {len(conversation_history)}")
                 if conversation_history:
-                    last_response = conversation_history[-1].get("response", "")
-                    self.logger.info(f"🔍 Last response: {last_response[:100]}...")
-                    self.logger.info(f"🔍 is_clarification_response returned: {self.context_manager.is_clarification_response(user_query)}")
-            
-            # Analyze the query with conversation history
-            query_analysis = self.intent_analyzer.analyze_query_intent(user_query, conversation_history)
+                    self.logger.info(f"🔍 Last response: {conversation_history[-1].get('response', '')[:200]}")
+                
+                # Check what type of clarification this is
+                last_response = conversation_history[-1].get("response", "")
+                clarification_context = self.context_manager.get_clarification_context()
+                
+                # Check if this is a visualization vs summary clarification response FIRST
+                viz_clarification_patterns = [
+                    "Would you like me to create a visualization",
+                    "Would you like me to create a chart",
+                    "visualization chart",
+                    "text summary"
+                ]
+                
+                is_viz_clarification = any(pattern in last_response for pattern in viz_clarification_patterns)
+                
+                if is_viz_clarification and clarification_context:
+                    self.logger.info(f"🔍 Visualization clarification handled, continuing with execution")
+                    # Create a query_analysis object to be updated by the clarification handler
+                    query_analysis = {}
+                    self.logger.info(f"🔍 Calling _handle_clarification_response with user_query: '{user_query}'")
+                    clarification_result = self._handle_clarification_response(user_query, query_analysis)
+                    self.logger.info(f"🔍 _handle_clarification_response returned: {clarification_result}")
+                    self.logger.info(f"🔍 Updated query_analysis: {query_analysis}")
+                    if clarification_result:
+                        # Still need more clarification
+                        self.context_manager.add_to_history(user_query, clarification_result, {})
+                        return clarification_result, None
+                    else:
+                        # Clarification handled, continue with execution
+                        self.logger.info(f"🔍 Visualization clarification handled, continuing with execution")
+                        # The query_analysis has been updated by _handle_clarification_response
+                        # Continue with the normal flow using the updated query_analysis
+                        # Skip the normal flow since we have the updated query_analysis
+                        return self._continue_with_updated_analysis(user_query, query_analysis, conversation_history)
+                        
+                # Check if this is a race clarification response
+                race_clarification_patterns = [
+                    "I couldn't identify which race",
+                    "Could you please specify the race",
+                    "Could you please specify which race",
+                    "which race you're interested in",
+                    "which race you would like",
+                    "which specific race",
+                    "which race you're referring to",
+                    "specify which race",
+                    "specify the race",
+                    "please specify",
+                    "could you please specify",
+                    "which race",
+                    "specific race"
+                ]
+                
+                is_race_clarification = any(pattern in last_response for pattern in race_clarification_patterns)
+                self.logger.info(f"🔍 Race clarification check - last response: '{last_response[:100]}...'")
+                self.logger.info(f"🔍 Is race clarification: {is_race_clarification}")
+                
+                # Debug: show which pattern matched
+                if is_race_clarification:
+                    for pattern in race_clarification_patterns:
+                        if pattern in last_response:
+                            self.logger.info(f"🔍 Matched race clarification pattern: '{pattern}'")
+                            break
+                
+                if is_race_clarification:
+                    self.logger.info(f"🔍 Handling race clarification response")
+                    # Extract race information from the user's response
+                    self.logger.info(f"🔍 Extracting race info from: '{user_query}'")
+                    extracted_meeting_info = self.intent_analyzer._extract_meeting_info(user_query)
+                    self.logger.info(f"🔍 Extracted meeting info: {extracted_meeting_info}")
+                    
+                    if extracted_meeting_info.get("name"):
+                        self.logger.info(f"🔍 Extracted race from clarification: {extracted_meeting_info}")
+                        
+                        # Get the original query context
+                        original_query = clarification_context.get("original_query", "")
+                        
+                        # Create new query analysis with the extracted race info
+                        # Re-analyze the original query to determine the specific visualization type
+                        original_query = clarification_context.get("original_query", "")
+                        reanalyzed_query = self.intent_analyzer.analyze_query_intent(original_query)
+                        
+                        # Update the query analysis with the extracted race info and reanalyzed query type
+                        query_analysis = {
+                            "query_type": reanalyzed_query.get("query_type", clarification_context.get("query_type", "")),
+                            "meeting_info": extracted_meeting_info,
+                            "session_type": clarification_context.get("session_type", "Race"),
+                            "drivers": clarification_context.get("drivers", []),
+                            "teams": clarification_context.get("teams", []),
+                            "lap_number": None,
+                            "context": {},
+                            "confidence": 0.9,
+                            "original_query": original_query
+                        }
+                        
+                        # Clear the clarification context
+                        self.context_manager.clear_clarification_context()
+                        
+                        # Continue with tool execution using the updated context
+                        self.logger.info(f"🔍 Using extracted race info for clarification: {query_analysis}")
+                        
+                        # Execute tools with the updated context
+                        tool_results = self._execute_tools_with_reasoning(original_query, query_analysis)
+                        
+                        # Generate response
+                        response = self._generate_intelligent_summary_with_reasoning(
+                            original_query, query_analysis, tool_results
+                        )
+                        
+                        # Extract visualization data if present
+                        visualization_data = None
+                        visualization_tools = [
+                            "create_lap_time_progression", "create_position_progression", 
+                            "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"
+                        ]
+                        
+                        for tool_name in visualization_tools:
+                            if tool_name in tool_results and tool_results[tool_name].get("success"):
+                                visualization_data = tool_results[tool_name]
+                                self.logger.info(f"🔍 Found visualization data: {visualization_data}")
+                                break
+                        
+                        # Store the exchange
+                        self.context_manager.add_to_history(original_query, response, query_analysis)
+                        
+                        return response, visualization_data
+                    else:
+                        # Couldn't extract race info, ask again
+                        return "I couldn't identify the race from your response. Please specify the race name (e.g., 'Monaco GP', 'Bahrain GP', etc.)", None
+                
+                # Check if this is a visualization vs summary clarification response
+                viz_clarification_patterns = [
+                    "Would you like me to create a visualization",
+                    "Would you like me to create a chart",
+                    "visualization chart",
+                    "text summary"
+                ]
+                
+                is_viz_clarification = any(pattern in last_response for pattern in viz_clarification_patterns)
+                
+                if is_viz_clarification and clarification_context:
+                    self.logger.info(f"🔍 Visualization clarification handled, continuing with execution")
+                    # Create a query_analysis object to be updated by the clarification handler
+                    query_analysis = {}
+                    clarification_result = self._handle_clarification_response(user_query, query_analysis)
+                    if clarification_result:
+                        # Still need more clarification
+                        self.context_manager.add_to_history(user_query, clarification_result, {})
+                        return clarification_result, None
+                    else:
+                        # Clarification handled, continue with execution
+                        self.logger.info(f"🔍 Visualization clarification handled, continuing with execution")
+                        # The query_analysis has been updated by _handle_clarification_response
+                        # Continue with the normal flow using the updated query_analysis
+                        
+            # Analyze the query with conversation history (only if not handled by clarification)
+            if not query_analysis or not query_analysis.get("query_type"):  # Only analyze if not already handled by clarification
+                query_analysis = self.intent_analyzer.analyze_query_intent(user_query, conversation_history)
             self.logger.info(f"🧠 Query analysis: {query_analysis}")
+            
+            # Validate the query and query analysis
+            try:
+                validation_result = self.query_validator.validate_query(user_query, query_analysis)
+                if not validation_result.is_valid:
+                    error_response = self.query_validator.format_error_response(validation_result, query_analysis.get("query_type"))
+                    self.logger.warning(f"❌ Query validation failed: {validation_result.errors}")
+                    # Add the error response to conversation history
+                    self.context_manager.add_to_history(user_query, error_response, query_analysis)
+                    return error_response, None
+                
+                # Log warnings if any
+                if validation_result.warnings:
+                    self.logger.warning(f"⚠️ Query validation warnings: {validation_result.warnings}")
+            except Exception as e:
+                self.logger.error(f"❌ Validation error: {e}")
+                # If validation fails, generate a basic error response for short queries
+                if len(user_query.strip()) <= 3:
+                    error_response = "Your query is too short. Please provide a complete query like 'lap time progression for Max Verstappen at Monaco GP'"
+                    self.context_manager.add_to_history(user_query, error_response, query_analysis)
+                    return error_response, None
+                else:
+                    # For other validation errors, continue with the query anyway
+                    self.logger.info("🔍 Continuing with query despite validation error")
             
             # Get enhanced context from ChromaDB
             enhanced_context = self.context_manager.get_enhanced_context(user_query, query_analysis)
@@ -618,6 +900,7 @@ class ReasoningEngine(BaseComponent):
             
             # Check if meeting is identified
             meeting_info = query_analysis.get("meeting_info", {})
+            self.logger.info(f"🔍 Meeting info check: {meeting_info}")
             if not meeting_info or not meeting_info.get("name"):
                 self.logger.info(f"🔍 No meeting identified, generating clarification")
                 
@@ -633,495 +916,813 @@ class ReasoningEngine(BaseComponent):
                 
                 self.logger.info(f"🔍 Stored clarification context: {self.context_manager.get_clarification_context()}")
                 
-                clarification_prompt = f"""
-    The user asked: "{user_query}"
-
-    I couldn't identify which race they're asking about. Please ask them to specify the race in a friendly, helpful way.
-    Suggest some examples like "Bahrain Grand Prix", "Miami Grand Prix", etc.
-    """
-                
-                try:
-                    response = self.llm.invoke(clarification_prompt).content
-                    # ADD THIS: Add the clarification request to conversation history
-                    self.context_manager.add_to_history(user_query, response, query_analysis)
-                    self.logger.info(f"🔍 Added clarification request to history")
-                    return response
-                except Exception as e:
-                    self.logger.warning(f"Failed to generate meeting clarification with LLM: {e}")
-                    fallback_response = ("I'd be happy to help! However, I couldn't identify which race you're asking about. "
-                        "Could you please specify the race? For example: 'Bahrain Grand Prix', 'Miami Grand Prix', "
-                        "'Chinese Grand Prix', etc.")
-                    # ADD THIS: Add the fallback clarification to conversation history
-                    self.context_manager.add_to_history(user_query, fallback_response, query_analysis)
-                    self.logger.info(f"🔍 Added fallback clarification to history")
-                    return fallback_response
+                # Generate a direct, helpful clarification response
+                response = f"I couldn't identify which race you're asking about. Could you please specify the race? For example: 'Bahrain Grand Prix', 'Miami Grand Prix', 'Monaco Grand Prix', etc."
+                self.context_manager.add_to_history(user_query, response, query_analysis)
+                self.logger.info(f"🔍 Added clarification request to history")
+                return response, None
             
-            # Execute tools based on query analysis
-            tool_results = self._execute_tools_for_query(user_query, query_analysis)
-            self.logger.info(f"🧠 Tool results: {tool_results}")
+            # Check for ambiguous queries that need clarification about visualization vs summary
+            clarification_needed = self._check_for_ambiguous_query(user_query, query_analysis)
+            if clarification_needed:
+                self.logger.info(f"🔍 Ambiguous query detected, asking for clarification")
+                self.context_manager.add_to_history(user_query, clarification_needed, query_analysis)
+                return clarification_needed, None
             
-            # Generate intelligent summary with enhanced context
-            if "error" in tool_results:
-                response = f"I apologize, but I encountered an error: {tool_results['error']}"
-            else:
-                # Generate context prompt from enhanced context
-                context_prompt = self.context_manager.generate_context_prompt(enhanced_context)
-                response = self._generate_intelligent_summary_with_context(user_query, query_analysis, tool_results, context_prompt)
+            # Execute tools with enhanced reasoning
+            tool_results = self._execute_tools_with_reasoning(user_query, query_analysis)
+            
+            # Generate intelligent response
+            response = self._generate_intelligent_summary_with_reasoning(user_query, query_analysis, tool_results)
             
             # Add to conversation history with enhanced context
             self.context_manager.add_to_history(user_query, response, query_analysis)
             
-            # Return both response and visualization data
-            return response, tool_results.get("visualization")
+            # Extract visualization data if present
+            visualization_data = None
+            visualization_tools = [
+                "create_lap_time_progression", "create_position_progression", 
+                "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"
+            ]
+            
+            for tool_name in visualization_tools:
+                if tool_name in tool_results and tool_results[tool_name].get("success"):
+                    visualization_data = tool_results[tool_name]
+                    self.logger.info(f"🔍 Found visualization data: {visualization_data}")
+                    break
+            
+            return response, visualization_data
             
         except Exception as e:
             self.logger.error(f"❌ Error in reasoning: {e}")
             return f"I apologize, but I encountered an error while processing your request: {str(e)}", None
-    
-    def _generate_intelligent_summary_with_context(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any], context_prompt: str) -> str:
-        """Generate intelligent summary with enhanced context"""
+
+    def _continue_with_updated_analysis(self, user_query: str, query_analysis: Dict[str, Any], conversation_history: List[Dict]) -> tuple:
+        """Continue processing with updated query analysis from clarification handling"""
+        try:
+            self.logger.info(f"🧠 Continuing with updated query analysis: {query_analysis}")
+            
+            # Validate the updated query analysis
+            try:
+                validation_result = self.query_validator.validate_query(user_query, query_analysis)
+                if not validation_result.is_valid:
+                    error_response = self.query_validator.format_error_response(validation_result, query_analysis.get("query_type"))
+                    self.logger.warning(f"❌ Query validation failed in updated analysis: {validation_result.errors}")
+                    # Add the error response to conversation history
+                    self.context_manager.add_to_history(user_query, error_response, query_analysis)
+                    return error_response, None
+                
+                # Log warnings if any
+                if validation_result.warnings:
+                    self.logger.warning(f"⚠️ Query validation warnings in updated analysis: {validation_result.warnings}")
+            except Exception as e:
+                self.logger.error(f"❌ Validation error in updated analysis: {e}")
+                # If validation fails, continue with the query anyway
+                self.logger.info("🔍 Continuing with query despite validation error")
+            
+            # Get enhanced context from ChromaDB
+            enhanced_context = self.context_manager.get_enhanced_context(user_query, query_analysis)
+            self.logger.info(f"🔍 Enhanced context: {enhanced_context}")
+            
+            # Execute tools with enhanced reasoning
+            tool_results = self._execute_tools_with_reasoning(user_query, query_analysis)
+            
+            # Generate intelligent response
+            response = self._generate_intelligent_summary_with_reasoning(user_query, query_analysis, tool_results)
+            
+            # Add to conversation history with enhanced context
+            self.context_manager.add_to_history(user_query, response, query_analysis)
+            
+            # Extract visualization data if present
+            visualization_data = None
+            visualization_tools = [
+                "create_lap_time_progression", "create_position_progression", 
+                "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"
+            ]
+            
+            for tool_name in visualization_tools:
+                if tool_name in tool_results and tool_results[tool_name].get("success"):
+                    visualization_data = tool_results[tool_name]
+                    self.logger.info(f"🔍 Found visualization data: {visualization_data}")
+                    break
+            
+            return response, visualization_data
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in continuing with updated analysis: {e}")
+            return f"I apologize, but I encountered an error while processing your request: {str(e)}", None
+
+    def _execute_single_tool(self, tool_name: str, tool_config: Dict[str, Any], query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a single tool with proper error handling"""
+        
+        try:
+            if tool_name in self.tools:
+                tool = self.tools[tool_name]
+                
+                # Check if the tool's execute method is async
+                if inspect.iscoroutinefunction(tool.execute):
+                    # Handle async execution
+                    try:
+                        # Try to get the current event loop
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # If we're already in an event loop, we need to handle this differently
+                            # For now, let's try to run it in a new thread
+                            import concurrent.futures
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(asyncio.run, tool.execute(tool_config))
+                                result = future.result(timeout=30)  # 30 second timeout
+                        else:
+                            # If no event loop is running, we can use asyncio.run
+                            result = asyncio.run(tool.execute(tool_config))
+                    except RuntimeError as e:
+                        if "asyncio.run() cannot be called from a running event loop" in str(e):
+                            # Fallback: try to create a new event loop
+                            import concurrent.futures
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(self._run_async_tool, tool, tool_config)
+                                result = future.result(timeout=30)
+                        else:
+                            raise e
+                else:
+                    # Synchronous execution
+                    result = tool.execute(tool_config)
+                
+                # Convert ToolResult to dict if needed
+                if hasattr(result, 'success'):
+                    # This is a ToolResult object - convert to dict
+                    result_dict = {
+                        "success": result.success,
+                        "data": result.data,
+                        "error": getattr(result, 'error', None),
+                        "sql_query": getattr(result, 'sql_query', None),
+                        "sql_params": getattr(result, 'sql_params', None),
+                        "execution_time": getattr(result, 'execution_time', None)
+                    }
+                    
+                    # For visualization tools, extract key fields to top level for frontend
+                    if tool_name in ["create_lap_time_progression", "create_position_progression", 
+                                   "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"]:
+                        if result.success and result.data:
+                            result_dict.update({
+                                "filename": result.data.get("filename"),
+                                "visualization_type": result.data.get("visualization_type"),
+                                "session_key": result.data.get("session_key"),
+                                "total_laps": result.data.get("total_laps"),
+                                "total_drivers": result.data.get("total_drivers"),
+                                "drivers_included": result.data.get("drivers_included", [])
+                            })
+                    
+                    return result_dict
+                elif hasattr(result, 'content'):
+                    return {"content": result.content, "success": True}
+                elif isinstance(result, dict):
+                    return result
+                else:
+                    return {"content": str(result), "success": True}
+            else:
+                self.logger.warning(f"🔧 Tool {tool_name} not found")
+                return {"error": f"Tool {tool_name} not available"}
+        except Exception as e:
+            self.logger.error(f"❌ Error executing tool {tool_name}: {str(e)}")
+            return {"error": f"Error executing {tool_name}: {str(e)}"}
+
+    def _run_async_tool(self, tool, tool_config):
+        """Helper method to run async tool in a separate thread"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(tool.execute(tool_config))
+        finally:
+            loop.close()
+
+    def _validate_tool_results(self, tool_results: Dict[str, Any], query_analysis: Dict[str, Any]) -> str:
+        """Validate tool results and provide feedback"""
+        
+        errors = []
+        successes = []
+        
+        for tool_name, result in tool_results.items():
+            if "error" in result:
+                errors.append(f"{tool_name}: {result['error']}")
+            else:
+                successes.append(tool_name)
+        
+        if errors:
+            return f"Errors: {', '.join(errors)}"
+        else:
+            return f"All tools executed successfully: {', '.join(successes)}"
+
+    def _generate_intelligent_summary_with_reasoning(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any]) -> str:
+        """Generate intelligent summary with enhanced reasoning"""
         
         if "error" in tool_results:
-            return f"I apologize, but I encountered an error: {tool_results['error']}"
-        
-        # Create a filtered version of tool_results for LLM
-        filtered_tool_results = {}
-        for key, value in tool_results.items():
-            if key == "visualization":
-                if value.get("success"):
-                    viz_data = value
-                    filtered_tool_results[key] = {
-                        "success": viz_data.get("success"),
-                        "visualization_type": viz_data.get("visualization_type", "data visualization"),
-                        "filename": viz_data.get("filename"),
-                        "session_key": viz_data.get("session_key"),
-                        "total_laps": viz_data.get("total_laps"),
-                        "total_drivers": viz_data.get("total_drivers"),
-                        "drivers_included": viz_data.get("drivers_included", [])[:5]
-                    }
+            error_msg = tool_results['error']
+            
+            # Provide more helpful error responses based on the error type
+            if "Could not find meeting" in error_msg:
+                return f"I couldn't find the race you specified in our database. Please check the race name and try again. Valid races include: Monaco Grand Prix, British Grand Prix, Bahrain Grand Prix, etc."
+            elif "Could not find session" in error_msg:
+                return f"I couldn't find the session type you specified. Most data is available for 'Race' sessions. Try specifying 'Race' instead of other session types."
+            elif "No performance data found" in error_msg:
+                query_type = query_analysis.get("query_type", "")
+                if query_type == "driver_performance":
+                    return f"I couldn't find performance data for the specified driver. Please check the driver name and try again. Valid drivers include: Max Verstappen, Lewis Hamilton, Charles Leclerc, etc."
+                elif query_type == "team_performance":
+                    return f"I couldn't find performance data for the specified team. Please check the team name and try again. Valid teams include: Red Bull, Mercedes, Ferrari, McLaren, etc."
+                else:
+                    return f"I couldn't find the data you requested. Please check your query and try again."
             else:
-                filtered_tool_results[key] = value
+                return f"I encountered an issue processing your query. Please try a simpler query like:\n• 'lap time progression for Max Verstappen at Monaco GP'\n• 'team performance for Red Bull at Bahrain GP'"
+        
+        # Check if there are any successful tool results
+        has_successful_results = False
+        for tool_name, result in tool_results.items():
+            if isinstance(result, dict) and result.get("success"):
+                has_successful_results = True
+                break
+        
+        # If no successful results, provide a helpful error message
+        if not has_successful_results:
+            return "I couldn't find any data for your query. Please try a simpler query like:\n• 'lap time progression for Max Verstappen at Monaco GP'\n• 'team performance for Red Bull at Bahrain GP'\n• 'sector analysis for Charles Leclerc at Silverstone'"
+        
+        # Get conversation context
+        conversation_context = self._get_conversation_context()
+        
+        # Check if visualization was generated - look for visualization tool results
+        visualization_tools = [
+            "create_lap_time_progression", "create_position_progression", 
+            "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"
+        ]
+        
+        has_visualization = False
+        viz_data = None
+        for tool_name in visualization_tools:
+            if tool_name in tool_results and tool_results[tool_name].get("success"):
+                has_visualization = True
+                viz_data = tool_results[tool_name]
+                break
+        
+        viz_type = "data visualization"
+        if viz_data:
+            viz_type = viz_data.get("visualization_type", "data visualization")
+        
+        # Create filtered tool results for LLM
+        filtered_tool_results = self._filter_tool_results_for_llm(tool_results)
+        
+        # Add debugging for visualization data
+        if has_visualization:
+            self.logger.info(f"🔍 Visualization detected: {viz_data}")
+            self.logger.info(f"🔍 Filtered tool results for LLM: {filtered_tool_results}")
         
         # Determine query type and use appropriate prompt
         query_type = query_analysis.get("query_type", "")
         
-        if query_type == "visualization":
-            summary_prompt = self._get_visualization_prompt_with_context(user_query, query_analysis, filtered_tool_results, context_prompt)
+        if has_visualization or query_type == "visualization":
+            summary_prompt = self._get_enhanced_visualization_prompt(user_query, query_analysis, filtered_tool_results, conversation_context, viz_type)
         else:
-            summary_prompt = self._get_text_query_prompt_with_context(user_query, query_analysis, filtered_tool_results, context_prompt)
+            summary_prompt = self._get_enhanced_text_prompt(user_query, query_analysis, filtered_tool_results, conversation_context)
         
         try:
             messages = [SystemMessage(content=summary_prompt)]
             response = self.llm.invoke(messages)
             answer = response.content
             
+            # If visualization was generated, keep the response clean and natural
+            # The visualization will be displayed by the frontend automatically
+            # No need to add technical metadata to the response
+            
             return answer
             
         except Exception as e:
             self.logger.error(f"❌ Error generating summary: {e}")
-            return self._generate_basic_summary(user_query, query_analysis, tool_results)
+            
+            # Check if it's a token limit error
+            if "context length" in str(e) or "128000 tokens" in str(e) or "maximum context length" in str(e):
+                return "Your query is too long and I can't process that much data at once. Please try a more specific query like:\n• 'lap time progression for Max Verstappen at Monaco GP'\n• 'team performance for Red Bull at Bahrain GP'\n• 'sector analysis for Charles Leclerc at Silverstone'"
+            else:
+                return self._generate_basic_summary(user_query, query_analysis, tool_results)
 
-
-    def _get_visualization_prompt_with_context(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], context_prompt: str) -> str:
-        """Generate prompt for visualization with enhanced context"""
-        return f"""{context_prompt}
-
-    You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary about the visualization you've created.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Data Retrieved:
-    {json.dumps(filtered_tool_results, indent=2)}
-
-    I have generated a data visualization for you to view below.
-
-    VISUALIZATION RESPONSE REQUIREMENTS:
-    1. Start with a friendly, brief introduction about what you've created
-    2. Mention the specific race and session
-    3. Explain what the visualization shows and what insights can be gained
-    4. Mention that graph analysis capabilities will be available soon
-    5. Keep it concise and to the point
-    6. Do NOT mention filenames or technical details
-
-    FORMATTING FOR VISUALIZATIONS:
-    - Be friendly but concise
-    - Do NOT list individual driver names unless specifically asked
-    - Focus on what the visualization shows, not who is included
-    - Use proper line breaks between sections
-    - Keep the tone engaging but factual
-    - Do NOT mention file paths, filenames, or technical implementation details
-
-    Write your response in a friendly, conversational tone with proper line breaks and formatting.
-    """
-
-    def _get_text_query_prompt_with_context(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], context_prompt: str) -> str:
-        """Generate prompt for text queries with enhanced context"""
+    def _filter_tool_results_for_llm(self, tool_results: Dict[str, Any]) -> Dict[str, Any]:
+        """Filter tool results to remove sensitive data before sending to LLM"""
         
-        # Check if this is a comparison query
-        if query_analysis.get("query_type") == "comparison" and "driver_comparison" in filtered_tool_results:
-            return f"""{context_prompt}
-
-    You are an expert F1 analyst. The user is asking for a comparison between specific drivers. Focus ONLY on comparing the two drivers mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Driver Comparison Data:
-    {json.dumps(filtered_tool_results.get("driver_comparison", {}), indent=2)}
-
-    DRIVER COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the two specific drivers that were requested
-    2. Present their performance side by side
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Highlight who was faster, more consistent, etc.
-    5. Do NOT mention other drivers or podium finishers unless specifically relevant
-    6. Keep the response focused and concise
-
-    FORMATTING FOR DRIVER COMPARISON:
-    - Start with a brief introduction mentioning the two drivers being compared
-    - Present each driver's key metrics (best lap, average lap, consistency)
-    - Provide a direct comparison highlighting the differences
-    - Keep it factual and focused on the requested comparison
-
-    Example format:
-    Max Verstappen vs Lewis Hamilton - Monaco GP 2025 Race Comparison:
-
-    Max Verstappen (Red Bull Racing):
-    - Best Lap: 01:14.230
-    - Average Lap: 01:17.962
-    - Consistency: 6.904 seconds
-
-    Lewis Hamilton (Ferrari):
-    - Best Lap: 01:14.089
-    - Average Lap: 01:18.075
-    - Consistency: 6.728 seconds
-
-    Comparison: Lewis Hamilton was slightly faster with a best lap of 01:14.089 vs Verstappen's 01:14.230, but Verstappen had a better average lap time.
-
-    Write your response focusing specifically on the requested driver comparison.
-    """
-        elif query_analysis.get("query_type") == "position_analysis" and "position_progression" in filtered_tool_results:
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for position progression analysis.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-    Drivers: {query_analysis.get("drivers", [])}
-    Position Progression Data:
-    {json.dumps(filtered_tool_results.get("position_progression", {}), indent=2)}
-
-    POSITION PROGRESSION ANALYSIS RESPONSE REQUIREMENTS:
-    1. Analyze the position changes throughout the race for the specified driver(s)
-    2. Identify key moments when positions changed significantly
-    3. Explain the factors that led to position gains or losses
-    4. Highlight strategic overtakes, pit stops, or incidents that affected positions
-    5. Compare the driver's starting position to their finishing position
-    6. Provide insights on race pace, consistency, and strategic decisions
-    7. Mention any notable battles or defensive driving
-    8. Analyze the overall race strategy and its effectiveness
-
-    TIME FORMATTING REQUIREMENTS:
-    - Convert timestamps to readable format: "Lap X" or "XX minutes into the race"
-    - Use relative time references like "early in the race", "mid-race", "towards the end"
-    - For specific lap references, use "Lap X" format
-    - Avoid raw timestamps like "13:29:16.778"
-    - Use natural language like "around the 15-minute mark" or "with 10 laps remaining"
-
-    ANALYSIS STRUCTURE:
-    - Start with an overview of the driver's race performance
-    - Break down the race into key phases (start, middle, end)
-    - Identify the most significant position changes and their causes
-    - Compare performance to expectations and qualifying position
-    - Provide insights on race strategy and execution
-    - Conclude with an overall assessment of the driver's performance
-
-    EXAMPLE TIME FORMATTING:
-    Instead of: "He moved to 3rd place at 13:29:16.778"
-    Use: "He moved to 3rd place early in the race" or "He moved to 3rd place around Lap 5"
-
-    Instead of: "He dropped to 2nd place at 13:40:42.106"
-    Use: "He dropped to 2nd place during his first pit stop" or "He dropped to 2nd place around the 20-minute mark"
-
-    Write your response focusing specifically on the position progression analysis with properly formatted time references."""
+        filtered_results = {}
+        for key, value in tool_results.items():
+            # Handle visualization tool results
+            if key in ["create_lap_time_progression", "create_position_progression", 
+                      "create_sector_analysis", "create_pit_stop_analysis", "create_tire_strategy"]:
+                if isinstance(value, dict) and value.get("success"):
+                    viz_data = value
+                    filtered_results[key] = {
+                        "success": viz_data.get("success"),
+                        "visualization_type": viz_data.get("visualization_type", "data visualization"),
+                        "filename": viz_data.get("filename"),
+                        "session_key": viz_data.get("session_key"),
+                        "total_laps": viz_data.get("total_laps"),
+                        "total_drivers": viz_data.get("total_drivers"),
+                        "drivers_included": viz_data.get("drivers_included", [])[:5],
+                        "visualization_generated": True,
+                        "data_summary": f"Generated {viz_data.get('visualization_type', 'data visualization')} chart with {viz_data.get('total_drivers', 0)} drivers over {viz_data.get('total_laps', 0)} laps"
+                    }
+                else:
+                    filtered_results[key] = value
+            else:
+                filtered_results[key] = value
         
-        elif query_analysis.get("query_type") == "sector_analysis" and "sector_analysis" in filtered_tool_results:
-            # Filter and summarize sector analysis data to reduce token count
-            sector_data = filtered_tool_results.get("sector_analysis", {})
-            if "sector_data" in sector_data:
-                # Extract only the essential information for each driver
-                summarized_data = []
-                for driver_data in sector_data["sector_data"]:
-                    if driver_data.get("driver") and driver_data.get("best_sector1"):
-                        summarized_data.append({
-                            "driver": driver_data["driver"],
-                            "team": driver_data["team"],
-                            "best_sector1": driver_data["best_sector1"],
-                            "best_sector2": driver_data["best_sector2"],
-                            "best_sector3": driver_data["best_sector3"],
-                            "avg_sector1": driver_data.get("avg_sector1"),
-                            "avg_sector2": driver_data.get("avg_sector2"),
-                            "avg_sector3": driver_data.get("avg_sector3")
-                        })
+        return filtered_results
+
+    def _execute_tools_with_reasoning(self, user_query: str, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute tools with enhanced reasoning and chain-of-thought"""
+        
+        reasoning_steps = []
+        current_step = 1
+        
+        # Step 1: Analyze the query requirements
+        reasoning_steps.append(f"Step {current_step}: Analyzing query requirements")
+        current_step += 1
+        
+        query_type = query_analysis.get("query_type", "")
+        meeting_info = query_analysis.get("meeting_info", {})
+        drivers = query_analysis.get("drivers", [])
+        teams = query_analysis.get("teams", [])
+        
+        reasoning_steps.append(f"  - Query type: {query_type}")
+        reasoning_steps.append(f"  - Meeting: {meeting_info.get('name', 'Unknown')}")
+        reasoning_steps.append(f"  - Drivers: {drivers}")
+        reasoning_steps.append(f"  - Teams: {teams}")
+        
+        # Step 2: Determine required tools
+        reasoning_steps.append(f"Step {current_step}: Determining required tools")
+        current_step += 1
+        
+        required_tools = self._determine_required_tools(query_analysis)
+        reasoning_steps.append(f"  - Required tools: {list(required_tools.keys())}")
+        
+        # Step 3: Execute tools with reasoning
+        reasoning_steps.append(f"Step {current_step}: Executing tools")
+        current_step += 1
+        
+        tool_results = {}
+        meeting_key = None
+        session_key = None
+        
+        # First, get meeting and session keys
+        if "get_meeting_key" in required_tools:
+            try:
+                meeting_result = self._execute_single_tool("get_meeting_key", required_tools["get_meeting_key"], query_analysis)
+                if meeting_result.get("success"):
+                    # Extract meeting_key from ToolResult data
+                    if hasattr(meeting_result, 'data') and meeting_result.data:
+                        meeting_key = meeting_result.data.get("meeting_key")
+                    elif isinstance(meeting_result, dict) and "data" in meeting_result:
+                        meeting_key = meeting_result["data"].get("meeting_key")
+                    else:
+                        meeting_key = meeting_result.get("meeting_key")
+                    reasoning_steps.append(f"    ✓ Retrieved meeting key: {meeting_key}")
+                else:
+                    reasoning_steps.append(f"    ✗ Failed to get meeting key: {meeting_result.get('error')}")
+                    return {"error": f"Could not find meeting: {meeting_result.get('error')}"}
+            except Exception as e:
+                reasoning_steps.append(f"    ✗ Error getting meeting key: {str(e)}")
+                return {"error": f"Error getting meeting key: {str(e)}"}
+        
+        if "get_session_key" in required_tools and meeting_key:
+            try:
+                session_config = required_tools["get_session_key"].copy()
+                session_config["meeting_key"] = meeting_key
+                session_result = self._execute_single_tool("get_session_key", session_config, query_analysis)
+                if session_result.get("success"):
+                    # Extract session_key from ToolResult data
+                    if hasattr(session_result, 'data') and session_result.data:
+                        session_key = session_result.data.get("session_key")
+                    elif isinstance(session_result, dict) and "data" in session_result:
+                        session_key = session_result["data"].get("session_key")
+                    else:
+                        session_key = session_result.get("session_key")
+                    reasoning_steps.append(f"    ✓ Retrieved session key: {session_key}")
+                else:
+                    reasoning_steps.append(f"    ✗ Failed to get session key: {session_result.get('error')}")
+                    return {"error": f"Could not find session: {session_result.get('error')}"}
+            except Exception as e:
+                reasoning_steps.append(f"    ✗ Error getting session key: {str(e)}")
+                return {"error": f"Error getting session key: {str(e)}"}
+        
+        # Now execute the main tools with proper keys
+        for tool_name, tool_config in required_tools.items():
+            if tool_name in ["get_meeting_key", "get_session_key"]:
+                continue  # Already handled
                 
-                sector_data["sector_data"] = summarized_data
-
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for a sector comparison between specific drivers. Focus ONLY on comparing the sector performance of the drivers mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Sector Analysis Data:
-    {json.dumps(sector_data, indent=2)}
-
-    SECTOR COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the sector performance of the specific drivers requested
-    2. Present their sector times side by side for each sector (Sector 1, Sector 2, Sector 3)
-    3. Convert sector times from seconds to MM:SS.mmm format (e.g., 28.701 seconds becomes 00:28.701)
-    4. Highlight which driver was faster in each sector
-    5. Identify each driver's strongest and weakest sectors
-    6. Do NOT mention other drivers unless specifically relevant
-    7. Keep the response focused and concise
-
-    FORMATTING FOR SECTOR COMPARISON:
-    - Start with a brief introduction mentioning the two drivers being compared
-    - Present each driver's best sector times for all three sectors
-    - Provide a direct comparison highlighting the differences in each sector
-    - Identify which driver was faster in each sector
-    - Keep it factual and focused on the requested sector comparison
-
-    Example format:
-    Charles Leclerc vs Lando Norris - British GP 2025 Sector Comparison:
-
-    Charles Leclerc (Ferrari):
-    - Best Sector 1: 00:28.701
-    - Best Sector 2: 00:36.674
-    - Best Sector 3: 00:24.312
-
-    Lando Norris (McLaren):
-    - Best Sector 1: 00:28.747
-    - Best Sector 2: 00:36.673
-    - Best Sector 3: 00:24.312
-
-    Comparison: Charles Leclerc was faster in Sector 1 by 0.046 seconds, while Lando Norris was faster in Sector 2 by 0.001 seconds. Both drivers were equally fast in Sector 3.
-
-    Write your response focusing specifically on the requested sector comparison.
-    """
-        elif query_analysis.get("query_type") == "comparison" and "team_comparison" in filtered_tool_results:
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking for a comparison between specific teams. Focus ONLY on comparing the two teams mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Team Comparison Data:
-    {json.dumps(filtered_tool_results.get("team_comparison", {}), indent=2)}
-
-    TEAM COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the two specific teams that were requested
-    2. Present their performance side by side
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Highlight which team was faster, more consistent, etc.
-    5. Include individual driver performance within each team
-    6. Do NOT mention other teams or podium finishers unless specifically relevant
-    7. Keep the response focused and concise
-
-    FORMATTING FOR TEAM COMPARISON:
-    - Start with a brief introduction mentioning the two teams being compared
-    - Present each team's overall performance (total laps, average lap, best lap, consistency)
-    - Include individual driver performance within each team
-    - Provide a direct comparison highlighting the differences
-    - Keep it factual and focused on the requested team comparison
-
-    Example format:
-    Mercedes vs Red Bull Racing - Monaco GP 2025 Race Comparison:
-
-    Mercedes:
-    - Total Laps: 151
-    - Average Lap: 01:20.194
-    - Best Lap: 01:13.404
-    - Consistency: 6.441 seconds
-    - Best Position: 11th
-    - Drivers: George Russell (best lap: 01:13.404) and Kimi Antonelli (best lap: 01:13.518)
-
-    Red Bull Racing:
-    - Total Laps: 154
-    - Average Lap: 01:19.028
-    - Best Lap: 01:14.230
-    - Consistency: 6.404 seconds
-    - Best Position: 4th
-    - Drivers: Max Verstappen (best lap: 01:14.230) and Yuki Tsunoda (best lap: 01:14.913)
-
-    Comparison: Red Bull Racing had better overall performance with a lower average lap time and better finishing positions, while Mercedes showed slightly better consistency.
-
-    Write your response focusing specifically on the requested team comparison.
-    """
-
-        # Check if this is a driver performance query
-        elif query_analysis.get("query_type") == "driver_performance" and "driver_performance" in filtered_tool_results:
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about a specific driver's performance. Focus ONLY on that driver's performance data.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Driver Performance Data:
-    {json.dumps(filtered_tool_results.get("driver_performance", {}), indent=2)}
-
-    DRIVER PERFORMANCE RESPONSE REQUIREMENTS:
-    1. Focus ONLY on the specific driver's performance that was requested
-    2. Include their total laps, average lap time, best lap time, and consistency
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Mention their team and any notable aspects of their performance
-    5. Do NOT mention other drivers unless specifically relevant to the requested driver's performance
-    6. Keep the response focused and concise
-
-    FORMATTING FOR DRIVER PERFORMANCE:
-    - Start with the driver's name and team
-    - Include their total laps completed
-    - Show their best lap time and average lap time in MM:SS.mmm format
-    - Mention consistency if notable
-    - Keep it factual and focused on the requested driver
-
-    Example format:
-    Max Verstappen (Red Bull Racing) completed 78 laps in the Monaco Grand Prix 2025 Race. His best lap was 01:14.230 and his average lap time was 01:17.962. He showed good consistency with a standard deviation of 6.904 seconds across all his laps.
-
-    Write your response focusing specifically on the requested driver's performance.
-    """
-        elif query_analysis.get("query_type") == "tire_strategy" and "tire_strategy" in filtered_tool_results:
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about tire strategy analysis. Focus on the tire strategy data and stint information.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Tire Strategy Data:
-    {json.dumps(filtered_tool_results.get("tire_strategy", {}), indent=2)}
-
-    TIRE STRATEGY RESPONSE REQUIREMENTS:
-    1. Focus on tire compound usage, stint lengths, and strategy decisions
-    2. Include information about tire compounds used (Soft, Medium, Hard)
-    3. Mention stint durations and any notable tire management
-    4. If specific teams/drivers were requested, focus on their tire strategy
-    5. Include any pit stop timing related to tire changes
-    6. Keep the response focused and concise
-
-    FORMATTING FOR TIRE STRATEGY:
-    - Start with an overview of tire strategy for the session
-    - Include information about compounds used and stint lengths
-    - If comparing teams/drivers, show their tire strategy side by side
-    - Mention any notable tire management or strategy decisions
-    - Keep it factual and focused on tire strategy
-
-    Example format:
-    For the Monaco Grand Prix 2025 Race, the tire strategy involved primarily Medium and Hard compounds. Most drivers opted for a two-stop strategy, with the first stint averaging 25 laps on Medium tires.
-
-    Write your response focusing specifically on tire strategy and compound usage.
-    """
+            reasoning_steps.append(f"  - Executing {tool_name}")
+            try:
+                # Update tool config with proper keys
+                updated_config = tool_config.copy()
+                if "meeting_key" in updated_config and updated_config["meeting_key"] == "placeholder":
+                    updated_config["meeting_key"] = meeting_key
+                if "session_key" in updated_config and updated_config["session_key"] == "placeholder":
+                    updated_config["session_key"] = session_key
+                
+                result = self._execute_single_tool(tool_name, updated_config, query_analysis)
+                tool_results[tool_name] = result
+                
+                if result.get("success"):
+                    reasoning_steps.append(f"    ✓ {tool_name} completed successfully")
+                else:
+                    error_msg = result.get('error', 'Unknown error')
+                    reasoning_steps.append(f"    ✗ {tool_name} failed: {error_msg}")
+                    
+                    # Provide more helpful error messages based on the tool and error
+                    if "No performance data found" in error_msg:
+                        if tool_name == "get_driver_performance":
+                            reasoning_steps.append(f"      → No data available for the specified driver")
+                        elif tool_name == "get_team_performance":
+                            reasoning_steps.append(f"      → No data available for the specified team")
+                    elif "Could not find meeting" in error_msg:
+                        reasoning_steps.append(f"      → The specified race may not exist in our database")
+                    elif "Could not find session" in error_msg:
+                        reasoning_steps.append(f"      → The specified session type may not be available")
+            except Exception as e:
+                reasoning_steps.append(f"    ✗ {tool_name} failed: {str(e)}")
+                tool_results[tool_name] = {"error": str(e)}
         
-        elif query_analysis.get("query_type") == "pit_strategy" and "pit_stop_analysis" in filtered_tool_results:
-            return f"""{context_prompt}You are an expert F1 analyst. The user is asking about pit stop strategy analysis. Focus on the pit stop data and strategy insights.
+        # Step 4: Validate results
+        reasoning_steps.append(f"Step {current_step}: Validating results")
+        current_step += 1
+        
+        validation_result = self._validate_tool_results(tool_results, query_analysis)
+        reasoning_steps.append(f"  - Validation: {validation_result}")
+        
+        # Check if all tools failed
+        failed_tools = [name for name, result in tool_results.items() if "error" in result]
+        if len(failed_tools) == len(tool_results) and len(tool_results) > 0:
+            reasoning_steps.append(f"  - All tools failed, providing helpful suggestions")
+            # Add helpful suggestions to the tool_results
+            tool_results["suggestions"] = self._generate_failure_suggestions(query_analysis, failed_tools)
+        
+        # Log reasoning steps
+        self.logger.info("🧠 Reasoning steps:")
+        for step in reasoning_steps:
+            self.logger.info(f"  - {step}")
+        
+        return tool_results
 
-        User Query: {user_query}
-        Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-        Session: {query_analysis["session_type"]}
-
-        Pit Stop Analysis Data:
-        {json.dumps(filtered_tool_results.get("pit_stop_analysis", {}), indent=2)}
-
-        PIT STRATEGY RESPONSE REQUIREMENTS:
-        1. Focus on pit stop timing, frequency, and strategy
-        2. Include total pit stops, average pit stop duration, and fastest pit stops
-        3. Convert times from seconds to MM:SS.mmm format (e.g., 2.5 seconds becomes 00:02.500)
-        4. Mention any notable pit stop strategies or timing decisions
-        5. If specific teams/drivers were requested, focus on their pit stop performance
-        6. Keep the response focused and concise
-
-        FORMATTING FOR PIT STRATEGY:
-        - Start with an overview of pit stop activity
-        - Include total number of pit stops and average duration
-        - Highlight fastest pit stops and any notable strategies
-        - If comparing teams/drivers, show their pit stop performance side by side
-        - Keep it factual and focused on pit stop strategy
-
-        Example format:
-        For the Monaco Grand Prix 2025 Race, there were 15 pit stops with an average duration of 00:02.847 seconds. The fastest pit stop was completed by Red Bull Racing in 00:02.123 seconds.
-
-        Write your response focusing specifically on pit stop strategy and timing.
-        """
-        # Default prompt for other query types
+    def _determine_required_tools(self, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Determine which tools are required based on query analysis"""
+        
+        query_type = query_analysis.get("query_type", "")
+        meeting_info = query_analysis.get("meeting_info", {})
+        drivers = query_analysis.get("drivers", [])
+        teams = query_analysis.get("teams", [])
+        session_type = query_analysis.get("session_type", "Race")
+        
+        tools_needed = {}
+        
+        # Get meeting and session keys first
+        tools_needed["get_meeting_key"] = {
+            "event_name": meeting_info.get("name", ""),  # Fixed: Changed from meeting_name to event_name
+            "year": meeting_info.get("year", "")
+        }
+        
+        tools_needed["get_session_key"] = {
+            "meeting_key": "placeholder",  # Will be replaced after meeting_key is retrieved
+            "session_type": session_type
+        }
+        
+        # Map query types to specific tools - use the actual tool names from your system
+        if query_type == "comparison":
+            if drivers and len(drivers) >= 2:
+                tools_needed["compare_drivers"] = {
+                    "drivers": drivers,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            elif teams and len(teams) >= 2:
+                tools_needed["compare_teams"] = {
+                    "teams": teams,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            else:
+                # Fallback to driver comparison if no specific drivers/teams mentioned
+                tools_needed["compare_drivers"] = {
+                    "drivers": drivers,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+                
+        elif query_type == "driver_performance":
+            tools_needed["get_driver_performance"] = {
+                "driver_name": drivers[0] if drivers else None,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "team_performance":
+            tools_needed["get_team_performance"] = {
+                "team_name": teams[0] if teams else None,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "fastest_lap":
+            tools_needed["get_fastest_lap"] = {
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+            
+        elif query_type == "sector_analysis":
+            # Convert drivers and teams lists to comma-separated strings
+            driver_filter = ", ".join(drivers) if drivers else None
+            team_filter = ", ".join(teams) if teams else None
+            
+            tools_needed["get_sector_analysis"] = {
+                "driver_filter": driver_filter,
+                "team_filter": team_filter,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "position_analysis":
+            # Convert drivers and teams lists to comma-separated strings
+            driver_filter = ", ".join(drivers) if drivers else None
+            team_filter = ", ".join(teams) if teams else None
+            
+            tools_needed["get_position_progression"] = {
+                "driver_filter": driver_filter,
+                "team_filter": team_filter,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "lap_time_progression":
+            # Convert drivers list to string format for visualization tool
+            driver_filter = ", ".join(drivers) if drivers else None
+            team_filter = ", ".join(teams) if teams else None
+            
+            tools_needed["create_lap_time_progression"] = {
+                "driver_filter": driver_filter,
+                "team_filter": team_filter,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+            
+        elif query_type == "pit_strategy":
+            # Convert drivers and teams lists to comma-separated strings
+            driver_filter = ", ".join(drivers) if drivers else None
+            team_filter = ", ".join(teams) if teams else None
+            
+            tools_needed["get_pit_stop_analysis"] = {
+                "driver_filter": driver_filter,
+                "team_filter": team_filter,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "tire_strategy":
+            # Convert drivers and teams lists to comma-separated strings
+            driver_filter = ", ".join(drivers) if drivers else None
+            team_filter = ", ".join(teams) if teams else None
+            
+            tools_needed["get_tire_strategy"] = {
+                "driver_filter": driver_filter,
+                "team_filter": team_filter,
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+                
+        elif query_type == "incident_investigation":
+            tools_needed["investigate_incident"] = {
+                "meeting_key": "placeholder",
+                "session_key": "placeholder",
+                "lap_number": query_analysis.get("lap_number")
+            }
+            
+        elif query_type == "qualifying_results":
+            tools_needed["get_qualifying_results"] = {
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+            
+        elif query_type == "race_results":
+            tools_needed["get_race_results"] = {
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+            
+        elif query_type == "visualization":
+            # For visualization, we need to determine the specific type
+            original_query = query_analysis.get("original_query", "").lower()
+            self.logger.info(f"🔍 Visualization tool selection - original_query: '{original_query}'")
+            if "sector" in original_query:
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                self.logger.info(f"🔍 Selecting create_sector_analysis tool")
+                tools_needed["create_sector_analysis"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            elif "position" in original_query:
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                tools_needed["create_position_progression"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            elif "lap" in original_query or "time" in original_query:
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                tools_needed["create_lap_time_progression"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            elif "pit" in original_query:
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                tools_needed["create_pit_stop_analysis"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            elif "tire" in original_query or "tyre" in original_query:
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                tools_needed["create_tire_strategy"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
+            else:
+                # Fallback to general lap time progression for visualization
+                # Convert drivers list to string format for visualization tool
+                driver_filter = ", ".join(drivers) if drivers else None
+                team_filter = ", ".join(teams) if teams else None
+                
+                self.logger.info(f"🔍 Falling back to create_lap_time_progression tool")
+                tools_needed["create_lap_time_progression"] = {
+                    "driver_filter": driver_filter,
+                    "team_filter": team_filter,
+                    "meeting_key": "placeholder",
+                    "session_key": "placeholder"
+                }
         else:
-            return f"""{context_prompt}You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary that directly answers the user's question.
+            # Default to race results
+            tools_needed["get_race_results"] = {
+                "meeting_key": "placeholder",
+                "session_key": "placeholder"
+            }
+        
+        return tools_needed
 
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
+    def _get_enhanced_visualization_prompt(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], conversation_context: str, viz_type: str) -> str:
+        """Generate enhanced prompt for visualization queries with direct responses"""
+        
+        query_type = query_analysis.get("query_type", "")
+        
+        prompt = f"""You are a Formula 1 assistant. Answer the user's question directly and concisely.
 
-    Data Retrieved:
-    {json.dumps(filtered_tool_results, indent=2)}
+User Question: {user_query}
 
-    TEXT QUERY RESPONSE REQUIREMENTS:
-    1. Directly answer the user's question in a friendly, conversational tone
-    2. Include specific numbers, times, and positions
-    3. Use clear, factual language but be engaging
-    4. Convert lap times from seconds to MM:SS.mmm format (e.g., 93.614 seconds becomes 01:33.614)
-    5. Mention significant gaps only if noteworthy
-    6. Provide context and insights about the results
+Query Type: {query_type}
 
-    FORMATTING FOR TEXT QUERIES:
-    - Be friendly and conversational while staying factual
-    - Avoid overly dramatic phrases like "thrilling", "spectacular", "vibrant skies", "edge of their seats"
-    - Focus on facts: who, what times, what positions
-    - When displaying lap times, use MM:SS.mmm format
-    - If multiple fastest laps are provided, list them in order as a list with each entry as a new line from fastest to slowest
-    - Use proper line breaks and spacing for readability
-    - Provide additional context and insights when relevant
+Available Data: {filtered_tool_results}
 
-    IMPORTANT: When displaying lap times, use the format MM:SS.mmm (e.g., 01:33.614, 01:30.000, 01:35.123). Do NOT mix words and numbers for times.
+Instructions:
+- Answer the question directly without unnecessary introduction
+- Be concise and to the point
+- Focus on the key information the user asked for
+- Avoid academic language or lengthy explanations
+- If no data is available, say so clearly
+- Use bullet points for multiple items when helpful
+- For visualizations that were successfully generated, acknowledge the chart and provide brief insights about what the data shows
+- If the visualization shows limited data (e.g., only one driver), explain why (e.g., "The chart shows data for [driver] only, as [other driver] retired early")
+- Keep responses natural and conversational
+- Don't mention technical details like filenames or session keys
+- NEVER use third-person meta-commentary like "You could respond with..." or "Here's what you might say..."
+- ALWAYS respond as if you are directly answering the user
 
-    Example format:
-    For the Australian Grand Prix 2025 Race, here are the fastest lap times:
+Provide a direct answer:"""
+        
+        return prompt
 
-    1. Charles Leclerc (Ferrari) - 01:24.567
-    2. Carlos Sainz (Ferrari) - 01:24.789
-    3. Esteban Ocon (Alpine) - 01:25.123
+    def _get_enhanced_text_prompt(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], conversation_context: str) -> str:
+        """Generate enhanced text prompt for direct, concise responses"""
+        
+        query_type = query_analysis.get("query_type", "")
+        
+        # Create a more direct, concise prompt
+        prompt = f"""You are a Formula 1 assistant. Answer the user's question directly and concisely.
 
-    Charles Leclerc set the fastest lap of the session, with his Ferrari teammate Carlos Sainz close behind. The Alpine of Esteban Ocon rounded out the top three, showing strong pace throughout the session.
+User Question: {user_query}
 
-    Write your response in a direct, professional tone with proper line breaks and formatting.
-    """
+Query Type: {query_type}
 
+Available Data: {filtered_tool_results}
+
+Instructions:
+- Answer the question directly without unnecessary introduction
+- Be concise and to the point
+- Focus on the key information the user asked for
+- Avoid academic language or lengthy explanations
+- If no data is available, say so clearly
+- Use bullet points for multiple items when helpful
+- Format all lap times in MM:SS.mmm format (e.g., 74.089 seconds should be displayed as 01:14.089)
+- For average lap, best lap, and worst lap times, always use MM:SS.mmm format
+- Consistency can remain in seconds as it's a variance measure
+- NEVER use third-person meta-commentary like "You could respond with..." or "Here's what you might say..."
+- ALWAYS respond as if you are directly answering the user
+
+For pit stop analysis:
+- Provide insights and patterns rather than just listing all pit stops
+- Highlight key strategies, timing decisions, and notable performances
+- Mention fastest/slowest stops, strategic decisions, and team patterns
+- Focus on the most interesting or important aspects of the pit stop strategy
+
+Provide a direct answer:"""
+        
+        return prompt
+
+    def _extract_team_names(self, query: str) -> List[str]:
+        """Extract team names from query"""
+        team_mappings = {
+            "Mercedes": ["mercedes", "mercedes team", "mercedes amg"],
+            "Ferrari": ["ferrari", "ferrari team", "scuderia ferrari"],
+            "Red Bull Racing": ["red bull", "red bull racing", "red bull team", "redbull"],
+            "McLaren": ["mclaren", "mclaren team", "mclaren racing"],
+            "Aston Martin": ["aston martin", "aston martin team", "aston"],
+            "Alpine": ["alpine", "alpine team", "alpine racing"],
+            "Williams": ["williams", "williams team", "williams racing"],
+            "AlphaTauri": ["alphatauri", "alpha tauri", "alpha tauri team"],
+            "Alfa Romeo": ["alfa romeo", "alfa", "alfa romeo team"],
+            "Haas": ["haas", "haas team", "haas f1"],
+            "Sauber": ["sauber", "sauber team", "sauber racing"],
+            "Racing Bulls": ["racing bulls", "racing bulls team", "bulls"]
+        }
+        
+        query_lower = query.lower()
+        found_teams = []
+        
+        for full_name, aliases in team_mappings.items():
+            for alias in aliases:
+                if alias in query_lower:
+                    if full_name not in found_teams:
+                        found_teams.append(full_name)
+                    break
+        
+        return found_teams
 
     def _check_for_ambiguous_query(self, user_query: str, query_analysis: Dict[str, Any]) -> Optional[str]:
-        """Check if query is ambiguous and needs clarification about capabilities"""
+        """Check if query is ambiguous and needs clarification about visualization vs summary"""
         query_lower = user_query.lower()
         self.logger.info(f"🔍 Checking for ambiguous query: {user_query}")
         
-        # ADD THIS: Skip ambiguous check for specific query types
-        if query_analysis.get("query_type") in ["tire_strategy", "pit_strategy", "sector_analysis", "team_performance", "position_analysis"]:
-            self.logger.info(f" Skipping ambiguous check for specific query type: {query_analysis.get('query_type')}")
+        # Skip ambiguous check for specific query types that are clearly one type
+        if query_analysis.get("query_type") in ["race_results", "qualifying_results", "fastest_lap", "incident_investigation"]:
+            self.logger.info(f"🔍 Skipping ambiguous check for specific query type: {query_analysis.get('query_type')}")
             return None
+        
+        # Force pit_strategy queries to be treated as ambiguous (they can be text or visualization)
+        if query_analysis.get("query_type") == "pit_strategy":
+            self.logger.info(f"🔍 Forcing pit_strategy to be treated as ambiguous")
+            # Don't return None - continue with ambiguous check
         
         # First, check for CLEAR visualization keywords (should NOT trigger clarification)
         clear_viz_keywords = [
             "visualize", "visualization", "show me a", "create a", "plot", "graph", "chart",
             "display", "show the", "create a chart", "create a graph", "create a plot",
-            "show me the chart", "show me the graph", "show me the plot"
+            "show me the chart", "show me the graph", "show me the plot", "visualize the",
+            "create visualization", "show visualization", "display chart", "display graph",
+            "show me a chart", "show me a graph", "create a visualization", "show me a visualization"
         ]
 
         has_clear_viz = any(keyword in query_lower for keyword in clear_viz_keywords)
         if has_clear_viz:
             # This is clearly a visualization request, don't ask for clarification
+            query_analysis["query_type"] = "visualization"
             return None
         
         # Check for CLEAR text analysis keywords (should NOT trigger clarification)
         clear_text_keywords = [
             "summarize", "summary", "tell me", "what were", "give me the data",
             "describe", "explain", "analyze", "report", "details", "comparison", "between",
-            "progression", "changes", "movement", "development", "evolution", "history"
+            "progression", "changes", "movement", "development", "evolution", "history",
+            "text analysis", "text summary", "data summary", "performance summary"
         ]
         
         has_clear_text = any(keyword in query_lower for keyword in clear_text_keywords)
@@ -1134,18 +1735,27 @@ class ReasoningEngine(BaseComponent):
             # Lap time related
             "lap time progression", "lap times", "lap analysis", "lap comparison",
             "lap performance", "lap duration", "lap chart", "lap graph",
+            "lap time", "lap analysis between", "lap comparison between",
             
             # Position related  
             "position progression", "position changes", "position analysis",
             "how did positions change", "position comparison", "position chart",
+            "position changes for", "position analysis between", "position comparison between",
             
             # Sector related
             "sector analysis", "sector performance", "sector comparison",
             "sector times", "sector breakdown", "sector chart",
+            "sector analysis between", "sector comparison between", "sector times for",
             
             # Pit stop related
             "pit stop analysis", "pit stop performance", "pit stop timing",
             "pit stop strategy", "pit stop comparison", "pit stop chart",
+            "pit stop analysis between", "pit stop comparison between",
+            
+            # Tire strategy related
+            "tire strategy", "tyre strategy", "tire analysis", "tyre analysis",
+            "tire performance", "tyre performance", "tire comparison",
+            "tire strategy between", "tire comparison between", "tire compounds between",
             
             # General comparison patterns (only if not clearly visualization/text)
             "between", "versus", "vs", "compare", "comparison",
@@ -1157,70 +1767,52 @@ class ReasoningEngine(BaseComponent):
         has_ambiguous_pattern = any(pattern in query_lower for pattern in ambiguous_patterns)
         
         if has_ambiguous_pattern:
-            # Check if query has drivers/teams mentioned
+            # Store context for when user responds (don't require drivers/teams)
             drivers = query_analysis.get("drivers", [])
             teams = self._extract_team_names(user_query)
             
-            if drivers or teams:
-                # Store context for when user responds
-                self.context_manager.set_clarification_context({
-                    "meeting_info": query_analysis["meeting_info"],
-                    "session_type": query_analysis["session_type"],
-                    "drivers": drivers,
-                    "teams": teams,
-                    "original_query": user_query
-                })
-                
-                # Use LLM to generate a natural, well-formatted clarification
-                clarification_prompt = f"""
-    You are a helpful F1 data assistant. The user asked: "{user_query}"
-
-    This query could be interpreted in different ways. I can provide either:
-    1. A visualization (chart/graph) of the data
-    2. A text summary/analysis of the data
-
-    Please respond in a friendly, conversational way asking the user which they prefer. 
-    Make it sound natural and helpful, not robotic. Use proper formatting with line breaks.
-
-    Example response style:
-    "I can help you with that! Would you like me to create a visualization chart, or would you prefer a text summary of the data?"
-    """
-                
-                try:
-                    response = self.llm.invoke(clarification_prompt).content
-                    return response
-                except Exception as e:
-                    self.logger.warning(f"Failed to generate clarification with LLM: {e}")
-                    # Fallback to simple response
-                    return "I can help you with that! Would you like me to create a visualization chart, or would you prefer a text summary of the data?"
+            # Store context for when user responds
+            self.context_manager.set_clarification_context({
+                "meeting_info": query_analysis["meeting_info"],
+                "session_type": query_analysis["session_type"],
+                "drivers": drivers,
+                "teams": teams,
+                "original_query": user_query,
+                "query_type": query_analysis.get("query_type", "")
+            })
+            
+            # Generate a direct, helpful clarification response
+            return "I can help you with that! Would you like me to create a visualization chart, or would you prefer a text summary of the data?"
         
         return None
 
     def _handle_clarification_response(self, user_query: str, query_analysis: Dict[str, Any]) -> Optional[str]:
-        """Handle user's response to clarification questions"""
+        """Handle user's response to clarification about visualization vs summary"""
+        
         query_lower = user_query.lower()
         clarification_context = self.context_manager.get_clarification_context()
         
         if not clarification_context:
+            self.logger.warning("No clarification context found")
             return None
         
-        # Use LLM to interpret the user's response
-        interpretation_prompt = f"""
-    The user was asked about their preference for data analysis. They responded: "{user_query}"
-
-    Based on their response, determine if they want:
-    1. A visualization/chart/graph
-    2. A text summary/analysis
-
-    Respond with just "visualization" or "text_analysis".
-
-    If their response is unclear, respond with "unclear".
-    """
-        
         try:
-            interpretation = self.llm.invoke(interpretation_prompt).content.strip().lower()
+            # Use LLM to interpret the clarification response
+            interpretation_prompt = f"""
+The user was asked whether they wanted a visualization or text summary. They responded: "{user_query}"
+
+Please classify their response as either:
+- "visualization" (if they want a chart/graph)
+- "text_analysis" (if they want a text summary/analysis)
+- "unclear" (if the response is ambiguous)
+
+Respond with ONLY the classification.
+"""
             
-            if "visualization" in interpretation:
+            response = self.llm.invoke(interpretation_prompt)
+            interpretation = response.content.strip().lower()
+            
+            if "visualization" in interpretation or "chart" in interpretation or "graph" in interpretation:
                 # Update query analysis with stored context
                 query_analysis.update(clarification_context)
                 query_analysis["query_type"] = "visualization"
@@ -1228,14 +1820,13 @@ class ReasoningEngine(BaseComponent):
                 # Determine visualization type based on original query
                 original_query = clarification_context.get("original_query", "").lower()
                 
-                # More specific detection based on original query content
                 if "sector" in original_query:
                     query_analysis["visualization_type"] = "sector_analysis"
                 elif "position" in original_query:
                     query_analysis["visualization_type"] = "position_progression"
                 elif "pit" in original_query:
                     query_analysis["visualization_type"] = "pit_stop_analysis"
-                elif "tire" in original_query or "tyre" in original_query or "compound" in original_query:
+                elif "tire" in original_query or "tyre" in original_query:
                     query_analysis["visualization_type"] = "tire_strategy"
                 elif "lap" in original_query or "time" in original_query:
                     query_analysis["visualization_type"] = "lap_time_progression"
@@ -1246,7 +1837,7 @@ class ReasoningEngine(BaseComponent):
                 self.context_manager.clear_clarification_context()
                 return None  # Continue with execution
                 
-            elif "text_analysis" in interpretation or "text" in interpretation:
+            elif "text_analysis" in interpretation or "text" in interpretation or "summary" in interpretation:
                 # Update query analysis with stored context
                 query_analysis.update(clarification_context)
                 
@@ -1255,7 +1846,7 @@ class ReasoningEngine(BaseComponent):
                 
                 if "compare" in original_query or "vs" in original_query or "versus" in original_query:
                     query_analysis["query_type"] = "comparison"
-                    # IMPORTANT: Restore the original teams and drivers
+                    # Restore the original teams and drivers
                     if "teams" in clarification_context:
                         query_analysis["teams"] = clarification_context["teams"]
                     if "drivers" in clarification_context:
@@ -1266,10 +1857,15 @@ class ReasoningEngine(BaseComponent):
                     query_analysis["query_type"] = "position_analysis"
                 elif "pit" in original_query:
                     query_analysis["query_type"] = "pit_strategy"
+                elif "tire" in original_query or "tyre" in original_query:
+                    query_analysis["query_type"] = "tire_strategy"
                 elif "lap" in original_query or "time" in original_query:
-                    query_analysis["query_type"] = "driver_performance"
+                    query_analysis["query_type"] = "lap_time_progression"
                 else:
-                    query_analysis["query_type"] = "driver_performance"
+                    # Preserve the original query type from the clarification context
+                    original_query_type = clarification_context.get("query_type", "driver_performance")
+                    query_analysis["query_type"] = original_query_type
+                    self.logger.info(f"🔍 Preserved original query type: {original_query_type} from clarification context")
                 
                 self.context_manager.clear_clarification_context()
                 return None  # Continue with execution
@@ -1277,9 +1873,9 @@ class ReasoningEngine(BaseComponent):
             else:
                 # Response was unclear, ask again using LLM
                 follow_up_prompt = f"""
-    The user's response "{user_query}" was unclear. Please ask them again in a friendly way 
-    to clarify whether they want a visualization or text analysis. Be conversational and helpful.
-    """
+The user's response "{user_query}" was unclear. Please ask them again in a friendly way 
+to clarify whether they want a visualization or text analysis. Be conversational and helpful.
+"""
                 
                 try:
                     follow_up = self.llm.invoke(follow_up_prompt).content
@@ -1306,6 +1902,8 @@ class ReasoningEngine(BaseComponent):
                     query_analysis["visualization_type"] = "position_progression"
                 elif "pit" in original_query:
                     query_analysis["visualization_type"] = "pit_stop_analysis"
+                elif "tire" in original_query or "tyre" in original_query:
+                    query_analysis["visualization_type"] = "tire_strategy"
                 elif "lap" in original_query or "time" in original_query:
                     query_analysis["visualization_type"] = "lap_time_progression"
                 else:
@@ -1314,1008 +1912,69 @@ class ReasoningEngine(BaseComponent):
                 self.context_manager.clear_clarification_context()
                 return None
             elif any(keyword in query_lower for keyword in text_keywords):
+                self.logger.info(f"🔍 Text summary requested, clarification context: {clarification_context}")
                 query_analysis.update(clarification_context)
                 
                 # Check if the original query was a comparison
                 original_query = clarification_context.get("original_query", "").lower()
                 if "compare" in original_query or "vs" in original_query or "versus" in original_query:
                     query_analysis["query_type"] = "comparison"
-                    # IMPORTANT: Restore the original teams and drivers
+                    # Restore the original teams and drivers
                     if "teams" in clarification_context:
                         query_analysis["teams"] = clarification_context["teams"]
                     if "drivers" in clarification_context:
                         query_analysis["drivers"] = clarification_context["drivers"]
                 else:
-                    query_analysis["query_type"] = "driver_performance"
+                    # Preserve the original query type from the clarification context
+                    original_query_type = clarification_context.get("query_type", "driver_performance")
+                    query_analysis["query_type"] = original_query_type
+                    self.logger.info(f"🔍 Preserved original query type: {original_query_type} from clarification context")
                 
                 self.context_manager.clear_clarification_context()
                 return None
             else:
                 return "I didn't quite understand. Would you like a visualization chart or a text summary?"
 
-    def _execute_tools_for_query(self, user_query: str, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute tools based on query analysis with proper session detection"""
-        tool_results = {}
-        sql_queries = []
-        
-        try:
-            # FIX: Safe access to meeting_info
-            meeting_info = query_analysis.get("meeting_info", {})
-            if not meeting_info or not meeting_info.get("name"):
-                return {"error": "No race specified. Please specify which race you're asking about."}
-            
-            session_type = query_analysis.get("session_type", "Race")
-            query_type = query_analysis.get("query_type", "race_results")
-            
-            # Add debugging here
-            self.logger.info(f"🔍 Executing tools for query type: {query_type}")
-            self.logger.info(f"🔍 Meeting info: {meeting_info}")
-            self.logger.info(f"🔍 Session type: {session_type}")
-            
-            # Step 1: Get meeting key
-            meeting_result = self.http_client.call_tool("get_meeting_key", {
-                "event_name": meeting_info["name"],
-                "year": meeting_info["year"]
-            })
-            if "sql_query" in meeting_result:
-                sql_queries.append({"tool": "get_meeting_key", "query": meeting_result["sql_query"], "params": meeting_result.get("sql_params", {})})
-            if not meeting_result.get("success"):
-                return {"error": f"Failed to get meeting key: {meeting_result.get('error')}"}
-            meeting_key = meeting_result.get("meeting_key")
-            tool_results["meeting_info"] = meeting_result
-            
-            # Step 2: Get session key with proper session type
-            session_result = self.http_client.call_tool("get_session_key", {
-                "meeting_key": meeting_key,
-                "session_type": session_type
-            })
-            if "sql_query" in session_result:
-                sql_queries.append({"tool": "get_session_key", "query": session_result["sql_query"], "params": session_result.get("sql_params", {})})
-            if not session_result.get("success"):
-                # Try alternative session types if the requested one fails
-                self.logger.warning(f"⚠️ {session_type} session not found, trying alternatives...")
-                
-                if session_type == "Sprint":
-                    # Try Race instead
-                    session_result = self.http_client.call_tool("get_session_key", {
-                        "meeting_key": meeting_key,
-                        "session_type": "Race"
-                    })
-                    if session_result.get("success"):
-                        self.logger.info("📝 Note: Using Race session as Sprint not available")
-                
-                if not session_result.get("success"):
-                    return {"error": f"No {session_type} session found for this race weekend"}
-            
-            session_key = session_result.get("session_key")
-            tool_results["session_info"] = session_result
-            
-            # Step 3: Execute specific tools based on query type
-            drivers = query_analysis.get("drivers", [])
-            teams = query_analysis.get("teams", [])
-            
-            # Add debugging for team extraction
-            self.logger.info(f"�� Extracted teams: {teams}")
-            self.logger.info(f"�� Extracted drivers: {drivers}")
-            
-            # Prepare filters - handle multiple drivers/teams
-            driver_filter = None
-            team_filter = None
-            
-            if drivers:
-                if len(drivers) == 1:
-                    driver_filter = drivers[0]
-                else:
-                    # Multiple drivers - join with commas
-                    driver_filter = ", ".join(drivers)
-            
-            if teams:
-                if len(teams) == 1:
-                    team_filter = teams[0]
-                else:
-                    # Multiple teams - join with commas
-                    team_filter = ", ".join(teams)
-            
-            if query_type == "visualization":
-                # Determine visualization type based on query content or stored context
-                viz_type = query_analysis.get("visualization_type") or self._determine_visualization_type(user_query, query_analysis)
-                
-                self.logger.info(f"🔍 Visualization - Type: {viz_type}, Driver: {driver_filter}, Team: {team_filter}")
-                
-                if viz_type == "lap_time_progression":
-                    tool_results["visualization"] = self.http_client.call_tool("create_lap_time_progression", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_lap_time_progression", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-                elif viz_type == "position_progression":
-                    tool_results["visualization"] = self.http_client.call_tool("create_position_progression", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_position_progression", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-                elif viz_type == "sector_analysis":
-                    tool_results["visualization"] = self.http_client.call_tool("create_sector_analysis", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_sector_analysis", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-                elif viz_type == "pit_stop_analysis":
-                    # Determine analysis type based on user query
-                    analysis_type = self._determine_pit_stop_analysis_type(user_query, query_analysis)
-                    
-                    tool_results["visualization"] = self.http_client.call_tool("create_pit_stop_analysis", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter,
-                        "analysis_type": analysis_type
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_pit_stop_analysis", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-                elif viz_type == "tire_strategy":
-                    tool_results["visualization"] = self.http_client.call_tool("create_tire_strategy", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_tire_strategy", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-                else:
-                    # Default to lap time progression
-                    tool_results["visualization"] = self.http_client.call_tool("create_lap_time_progression", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,
-                        "team_filter": team_filter
-                    })
-                    if "sql_query" in tool_results["visualization"]:
-                        sql_queries.append({"tool": "create_lap_time_progression", "query": tool_results["visualization"]["sql_query"], "params": tool_results["visualization"].get("sql_params", {})})
-            
-            elif query_type == "position_analysis":
-                # Handle position analysis as text query
-                tool_results["position_analysis"] = self.http_client.call_tool("get_position_progression", {
-                    "session_key": session_key,
-                    "driver_filter": driver_filter,
-                    "team_filter": team_filter,
-                    "progression_type": "all"
-                })
-                if "sql_query" in tool_results["position_analysis"]:
-                    sql_queries.append({"tool": "get_position_progression", "query": tool_results["position_analysis"]["sql_query"], "params": tool_results["position_analysis"].get("sql_params", {})})
-            
-            elif query_type == "sector_analysis":
-                # Determine sector analysis type based on query
-                query_lower = user_query.lower()
-                if any(word in query_lower for word in ["consistency", "consistent", "reliability"]):
-                    sector_analysis_type = "consistency"
-                elif any(word in query_lower for word in ["compare", "comparison", "vs", "versus"]):
-                    sector_analysis_type = "comparison"
-                elif any(word in query_lower for word in ["best", "fastest", "quickest"]):
-                    sector_analysis_type = "best_sectors"
-                else:
-                    sector_analysis_type = "all"
-                
-                tool_results["sector_analysis"] = self.http_client.call_tool("get_sector_analysis", {
-                    "session_key": session_key,
-                    "driver_filter": driver_filter,  # Use the properly formatted driver_filter
-                    "team_filter": team_filter,      # Use the properly formatted team_filter
-                    "sector_analysis_type": sector_analysis_type
-                })
-                if "sql_query" in tool_results["sector_analysis"]:
-                    sql_queries.append({"tool": "get_sector_analysis", "query": tool_results["sector_analysis"]["sql_query"], "params": tool_results["sector_analysis"].get("sql_params", {})})
-            
-            elif query_type == "comparison":
-                # Check if we have teams but no drivers (need to look up team drivers)
-                if teams and not drivers:
-                    self.logger.info(f"�� Found teams but no drivers, looking up team drivers")
-                    
-                    # Get drivers for each team
-                    all_drivers = []
-                    for team in teams:
-                        team_drivers_result = self.http_client.call_tool("get_team_drivers", {
-                            "session_key": session_key,
-                            "team_name": team
-                        })
-                        
-                        if team_drivers_result.get("success"):
-                            self.logger.info(f"🔍 Team drivers result: {team_drivers_result}")
-                            team_drivers = team_drivers_result.get("drivers", [])
-                            self.logger.info(f" Team drivers data: {team_drivers}")
-                            driver_names = [driver["full_name"] for driver in team_drivers]
-                            all_drivers.extend(driver_names)
-                            self.logger.info(f"🔍 Found drivers for {team}: {driver_names}")
-                        else:
-                            self.logger.warning(f"🔍 Failed to get drivers for team {team}")
-                    
-                    # Update the drivers list
-                    if all_drivers:
-                        drivers = all_drivers
-                        self.logger.info(f"🔍 Updated drivers list: {drivers}")
-                
-                # Check if it's a team comparison
-                if len(teams) >= 2:
-                    # Pass all teams to the tool
-                    tool_results["team_comparison"] = self.http_client.call_tool("compare_teams", {
-                        "session_key": session_key,
-                        "teams": teams,  # Pass the full list of teams
-                        "comparison_metrics": ["all"]
-                    })
-                    if "sql_query" in tool_results["team_comparison"]:
-                        sql_queries.append({"tool": "compare_teams", "query": tool_results["team_comparison"]["sql_query"], "params": tool_results["team_comparison"].get("sql_params", {})})
-                elif len(drivers) >= 2:
-                    tool_results["driver_comparison"] = self.http_client.call_tool("compare_drivers", {
-                        "session_key": session_key,
-                        "drivers": drivers,
-                        "comparison_metrics": ["all"]
-                    })
-                    if "sql_query" in tool_results["driver_comparison"]:
-                        sql_queries.append({"tool": "compare_drivers", "query": tool_results["driver_comparison"]["sql_query"], "params": tool_results["driver_comparison"].get("sql_params", {})})
-                else:
-                    return {"error": "Need to specify at least two drivers or teams for comparison"}
-            
-            elif query_type == "driver_performance":
-                if len(drivers) >= 1:
-                    tool_results["driver_performance"] = self.http_client.call_tool("get_driver_performance", {
-                        "session_key": session_key,
-                        "driver_name": drivers[0],
-                        "metrics": ["all"]
-                    })
-                    if "sql_query" in tool_results["driver_performance"]:
-                        sql_queries.append({"tool": "get_driver_performance", "query": tool_results["driver_performance"]["sql_query"], "params": tool_results["driver_performance"].get("sql_params", {})})
-                else:
-                    tool_results["error"] = "Need to specify a driver for performance analysis"
-
-            if query_type == "team_performance":
-                # Add debugging for team performance
-                self.logger.info(f"🔍 Executing team performance for teams: {teams}")
-                
-                # Extract team name from query
-                if teams:
-                    tool_results["team_performance"] = self.http_client.call_tool("get_team_performance", {
-                        "session_key": session_key,
-                        "team_name": teams[0]  # Changed from "team_filter" to "team_name"
-                    })
-                    if "sql_query" in tool_results["team_performance"]:
-                        sql_queries.append({"tool": "get_team_performance", "query": tool_results["team_performance"]["sql_query"], "params": tool_results["team_performance"].get("sql_params", {})})
-                else:
-                    tool_results["error"] = "Need to specify a team for performance analysis"
-                        
-            elif query_type == "fastest_lap":
-                # Add driver_filter and team_filter to the fastest lap tool call
-                tool_results["fastest_lap"] = self.http_client.call_tool("get_fastest_lap", {
-                    "session_key": session_key,
-                    "driver_filter": driver_filter,  # Add this line
-                    "team_filter": team_filter       # Add this line
-                })
-                if "sql_query" in tool_results["fastest_lap"]:
-                    sql_queries.append({"tool": "get_fastest_lap", "query": tool_results["fastest_lap"]["sql_query"], "params": tool_results["fastest_lap"].get("sql_params", {})})
-            
-            elif query_type == "tire_strategy":
-                # Use the already-formatted driver_filter and team_filter from earlier in the method
-                tool_results["tire_strategy"] = self.http_client.call_tool("get_tire_strategy", {
-                    "session_key": session_key,
-                    "driver_filter": driver_filter,  # ✅ Use the properly formatted string
-                    "team_filter": team_filter,      # ✅ Use the properly formatted string
-                    "strategy_type": "all"
-                })
-                if "sql_query" in tool_results["tire_strategy"]:
-                    sql_queries.append({"tool": "get_tire_strategy", "query": tool_results["tire_strategy"]["sql_query"], "params": tool_results["tire_strategy"].get("sql_params", {})})
-
-            elif query_type == "pit_strategy":
-                # Use the already-formatted driver_filter and team_filter from earlier in the method
-                tool_results["pit_stop_analysis"] = self.http_client.call_tool("get_pit_stop_analysis", {
-                    "session_key": session_key,
-                    "analysis_type": "all",
-                    "driver_filter": driver_filter,  # ✅ Use the properly formatted string
-                    "team_filter": team_filter       # ✅ Use the properly formatted string
-                })
-                
-                if "sql_query" in tool_results["pit_stop_analysis"]:
-                    sql_queries.append({
-                        "tool": "get_pit_stop_analysis", 
-                        "query": tool_results["pit_stop_analysis"]["sql_query"], 
-                        "params": tool_results["pit_stop_analysis"].get("sql_params", {})
-                    })
-                        
-            elif query_type == "incident_investigation":
-                lap_number = query_analysis.get("lap_number")
-                
-                # Determine analysis type based on query
-                if drivers and lap_number:
-                    analysis_type = "driver_specific_lap"
-                elif drivers:
-                    analysis_type = "driver"
-                elif lap_number:
-                    analysis_type = "specific_lap"
-                else:
-                    analysis_type = "summary"
-                
-                tool_results["incident_analysis"] = self.http_client.call_tool("investigate_incident", {
-                    "session_key": session_key,
-                    "driver_name": drivers[0] if drivers else None,
-                    "lap_number": lap_number,
-                    "analysis_type": analysis_type
-                })
-                if "sql_query" in tool_results["incident_analysis"]:
-                    sql_queries.append({"tool": "investigate_incident", "query": tool_results["incident_analysis"]["sql_query"], "params": tool_results["incident_analysis"].get("sql_params", {})})
-            
-            elif query_type == "sector_analysis":
-                # Determine sector analysis type based on query
-                query_lower = user_query.lower()
-                if any(word in query_lower for word in ["consistency", "consistent", "reliability"]):
-                    sector_analysis_type = "consistency"
-                elif any(word in query_lower for word in ["compare", "comparison", "vs", "versus"]):
-                    sector_analysis_type = "comparison"
-                elif any(word in query_lower for word in ["best", "fastest", "quickest"]):
-                    sector_analysis_type = "best_sectors"
-                else:
-                    sector_analysis_type = "all"
-                
-                if "sector_analysis" not in tool_results:
-                    tool_results["sector_analysis"] = self.http_client.call_tool("get_sector_analysis", {
-                        "session_key": session_key,
-                        "driver_filter": driver_filter,  # Use the properly formatted driver_filter
-                        "team_filter": team_filter,      # Use the properly formatted team_filter
-                        "sector_analysis_type": sector_analysis_type
-                    })
-                    if "sql_query" in tool_results["sector_analysis"]:
-                        sql_queries.append({"tool": "get_sector_analysis", "query": tool_results["sector_analysis"]["sql_query"], "params": tool_results["sector_analysis"].get("sql_params", {})})
-            
-            elif query_type == "qualifying_results":
-                tool_results["qualifying_results"] = self.http_client.call_tool("get_qualifying_results", {
-                    "session_key": session_key,
-                    "result_type": "top_10"
-                })
-                if "sql_query" in tool_results["qualifying_results"]:
-                    sql_queries.append({"tool": "get_qualifying_results", "query": tool_results["qualifying_results"]["sql_query"], "params": tool_results["qualifying_results"].get("sql_params", {})})
-            
-            else:  # race_results
-                # Extract number from query to determine result type
-                result_type = self._determine_race_result_type(user_query)
-                
-                tool_results["race_results"] = self.http_client.call_tool("get_race_results", {
-                    "session_key": session_key,
-                    "result_type": result_type,
-                    "include_lap_times": True
-                })
-                if "sql_query" in tool_results["race_results"]:
-                    sql_queries.append({"tool": "get_race_results", "query": tool_results["race_results"]["sql_query"], "params": tool_results["race_results"].get("sql_params", {})})
-            
-            tool_results["sql_queries"] = sql_queries
-            return tool_results
-        
-        except Exception as e:
-            tool_results["error"] = str(e)
-            self.logger.error(f"❌ Error executing tools: {e}")
-            return tool_results
-    
-
-    def _determine_pit_stop_analysis_type(self, user_query: str, query_analysis: Dict[str, Any]) -> str:
-        """Determine the type of pit stop analysis based on user query"""
-        query_lower = user_query.lower()
-        
-        # Extract drivers and teams from query analysis
+    def _generate_failure_suggestions(self, query_analysis: Dict[str, Any], failed_tools: List[str]) -> List[str]:
+        """Generate helpful suggestions when tools fail"""
+        suggestions = []
+        query_type = query_analysis.get("query_type", "")
         drivers = query_analysis.get("drivers", [])
         teams = query_analysis.get("teams", [])
+        meeting_info = query_analysis.get("meeting_info", {})
         
-        # Check for comparison keywords
-        comparison_keywords = ["compare", "vs", "versus", "difference", "who was better", "which driver was faster"]
-        for keyword in comparison_keywords:
-            if keyword in query_lower:
-                return "comparison"
+        # General suggestions
+        suggestions.append("Try using 'Race' session type instead of other sessions")
+        suggestions.append("Check that driver/team names are spelled correctly")
+        suggestions.append("Ensure the race name is correct (e.g., 'Monaco Grand Prix' not 'Monaco GP')")
         
-        # Check for comprehensive analysis keywords
-        comprehensive_keywords = ["comprehensive", "detailed", "full", "complete", "all", "everything", "thorough"]
-        for keyword in comprehensive_keywords:
-            if keyword in query_lower:
-                return "comprehensive"
-        
-        # Check for simple analysis keywords
-        simple_keywords = ["simple", "basic", "quick", "overview", "summary"]
-        for keyword in simple_keywords:
-            if keyword in query_lower:
-                return "simple"
-        
-        # Determine based on number of drivers/teams
-        if len(drivers) > 1 or len(teams) > 1:
-            return "comparison"
-        elif len(drivers) == 1 and len(teams) == 0:
-            return "simple"
-        elif len(teams) == 1 and len(drivers) == 0:
-            return "simple"
-        elif len(drivers) == 1 and len(teams) == 1:
-            return "simple"
-        else:
-            # Default to comprehensive for general queries
-            return "comprehensive"
-    
-
-    def _determine_visualization_type(self, user_query: str, query_analysis: Dict[str, Any]) -> str:
-        """Determine the type of visualization to create based on user query content"""
-        query_lower = user_query.lower()
-        
-        # Check for specific visualization types with priority order
-        
-        # 1. Position-related visualizations
-        position_keywords = [
-            "position", "positions", "grid", "order", "finishing position", 
-            "race order", "grid position", "starting position", "final position",
-            "position changes", "position progression", "how did positions change"
-        ]
-        if any(keyword in query_lower for keyword in position_keywords):
-            self.logger.info(f"✅ Detected position progression visualization")
-            return "position_progression"
-        
-        # 2. Sector-related visualizations
-        sector_keywords = [
-            "sector", "sectors", "sector 1", "sector 2", "sector 3", 
-            "first sector", "second sector", "third sector", "sector times",
-            "sector analysis", "sector performance", "sector breakdown",
-            "sector strengths", "sector weaknesses", "sector comparison"
-        ]
-        if any(keyword in query_lower for keyword in sector_keywords):
-            self.logger.info(f"✅ Detected sector analysis visualization")
-            return "sector_analysis"
-        
-        # 3. Pit stop-related visualizations
-        pit_stop_keywords = [
-            "pit", "pitstop", "pit stop", "pitstop", "stops", "pit stops",
-            "pit stop analysis", "pit stop strategy", "pit stop times",
-            "fastest pit stop", "pit stop duration", "pit stop performance",
-            "when did they pit", "how many stops", "pit stop timing"
-        ]
-        if any(keyword in query_lower for keyword in pit_stop_keywords):
-            self.logger.info(f"✅ Detected pit stop analysis visualization")
-            return "pit_stop_analysis"
-        
-        # 4. Tire strategy-related visualizations
-        tire_strategy_keywords = [
-            "tire", "tyre", "compound", "strategy", "stint", "stints",
-            "tire strategy", "tyre strategy", "tire compounds", "tyre compounds",
-            "tire management", "tyre management", "compound strategy",
-            "stint analysis", "tire wear", "tyre wear", "compound usage"
-        ]
-        if any(keyword in query_lower for keyword in tire_strategy_keywords):
-            return "tire_strategy"
-        
-        # 5. Lap time-related visualizations
-        lap_time_keywords = [
-            "lap time", "lap times", "lap duration", "lap progression",
-            "lap analysis", "lap performance", "lap chart", "lap graph",
-            "time progression", "lap by lap", "lap comparison"
-        ]
-        if any(keyword in query_lower for keyword in lap_time_keywords):
-            return "lap_time_progression"
-        
-        # 6. General visualization requests - try to infer from context
-        general_viz_keywords = [
-            "show me a graph", "create a chart", "visualize", "plot", "graph",
-            "show me the data", "display", "chart", "visualization", "graphical",
-            "show me a visualization", "create a plot", "show the trend",
-            "plot the data", "graph the results", "show me the progression",
-            "visualize the data", "create a diagram", "show me the analysis",
-        ]
-        if any(keyword in query_lower for keyword in general_viz_keywords):
-            # For general requests, check the query type to determine best visualization
-            query_type = query_analysis.get("query_type", "")
-            
-            if query_type == "comparison":
-                # For comparisons, lap time progression is usually most useful
-                return "lap_time_progression"
-            elif query_type == "driver_performance" or query_type == "team_performance":
-                # For performance analysis, sector analysis might be more insightful
-                return "sector_analysis"
-            elif query_type == "race_results":
-                # For race results, position progression is most relevant
-                return "position_progression"
+        # Type-specific suggestions
+        if query_type == "driver_performance":
+            if not drivers:
+                suggestions.append("Try specifying a driver: 'driver performance for Max Verstappen at Monaco GP'")
             else:
-                # Default to lap time progression for general requests
-                return "lap_time_progression"
-        
-        # 7. If no specific keywords found, check for driver/team mentions
-        drivers = query_analysis.get("drivers", [])
-        teams = self._extract_team_names(user_query)
-        
-        if drivers or teams:
-            # If specific drivers/teams mentioned, lap time progression is usually best
-            return "lap_time_progression"
-        
-        # 8. Final fallback - default to lap time progression
-        return "lap_time_progression"
-    
-        
-    def _extract_team_names(self, query: str) -> List[str]:
-        """Extract team names from query"""
-        team_mappings = {
-            "mercedes": "Mercedes",
-            "ferrari": "Ferrari", 
-            "mclaren": "McLaren",
-            "red bull": "Red Bull Racing",
-            "redbull": "Red Bull Racing",
-            "red bull racing": "Red Bull Racing",
-            "williams": "Williams",
-            "alpine": "Alpine",
-            "aston martin": "Aston Martin",
-            "astonmartin": "Aston Martin",
-            "haas": "Haas F1 Team",
-            "haas f1": "Haas F1 Team",
-            "rb": "Racing Bulls",
-            "bulls": "Racing Bulls",
-            "racing bulls": "Racing Bulls",
-            "sauber": "Sauber",
-            "stake": "Stake F1 Team",
-            "stake f1": "Stake F1 Team"
-        }
-        
-        query_lower = query.lower()
-        found_teams = []
-        
-        self.logger.info(f"🔍 Extracting teams from: '{query_lower}'")
-    
-        for team_alias, team_name in team_mappings.items():
-            if team_alias in query_lower:
-                self.logger.info(f"✅ Found team alias '{team_alias}' -> '{team_name}'")
-                if team_name not in found_teams:
-                    found_teams.append(team_name)
-        
-        self.logger.info(f"🔍 Final extracted teams: {found_teams}")
-        return found_teams
-    
-    def _determine_race_result_type(self, query: str) -> str:
-        """Determine the result type based on the user query"""
-        query_lower = query.lower()
-        
-        # Check for specific numbers
-        import re
-        numbers = re.findall(r'\d+', query_lower)
-        
-        if numbers:
-            num = int(numbers[0])
-            if num == 1:
-                return "winner_only"
-            elif num == 3:
-                return "podium"
+                suggestions.append("Try a different driver: 'driver performance for Lewis Hamilton at British GP'")
+        elif query_type == "team_performance":
+            if not teams:
+                suggestions.append("Try specifying a team: 'team performance for Red Bull at Bahrain GP'")
             else:
-                return f"top_{num}"  # Dynamic result type
+                suggestions.append("Try a different team: 'team performance for Ferrari at Silverstone'")
+        elif query_type == "lap_time_progression":
+            suggestions.append("Try: 'lap time progression for Max Verstappen at Monaco GP'")
+        elif query_type == "sector_analysis":
+            suggestions.append("Try: 'sector analysis for Charles Leclerc at Monaco GP'")
+        elif query_type == "position_analysis":
+            suggestions.append("Try: 'position progression for Lando Norris at Silverstone'")
+        elif query_type == "pit_strategy":
+            suggestions.append("Try: 'pit stop analysis for Max Verstappen at Monaco GP'")
+        elif query_type == "tire_strategy":
+            suggestions.append("Try: 'tire strategy for Lewis Hamilton at Bahrain GP'")
         
-        # Check for keywords
-        if any(word in query_lower for word in ["winner", "won", "first"]):
-            return "winner_only"
-        elif any(word in query_lower for word in ["podium", "top 3", "first 3"]):
-            return "podium"
-        else:
-            return "podium" 
+        # Meeting-specific suggestions
+        if meeting_info and meeting_info.get("name"):
+            suggestions.append(f"Try a different race: 'British Grand Prix', 'Bahrain Grand Prix', 'Australian Grand Prix'")
         
-    def _generate_intelligent_summary(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any]) -> str:
-        """Generate an intelligent text summary using LLM"""
-        
-        if "error" in tool_results:
-            return f"I apologize, but I encountered an error: {tool_results['error']}"
-        
-        # Get conversation context
-        conversation_context = self._get_conversation_context()
-        
-        # Check if visualization was generated and get its type safely
-        has_visualization = "visualization" in tool_results and tool_results["visualization"].get("success")
-        viz_type = "data visualization"
-        
-        # Create a filtered version of tool_results for LLM (exclude visualization data)
-        filtered_tool_results = {}
-        for key, value in tool_results.items():
-            if key == "visualization":
-                # Only include metadata, not the actual image data
-                if has_visualization:
-                    viz_data = value
-                    filtered_tool_results[key] = {
-                        "success": viz_data.get("success"),
-                        "visualization_type": viz_data.get("visualization_type", "data visualization"),
-                        "filename": viz_data.get("filename"),
-                        "session_key": viz_data.get("session_key"),
-                        "total_laps": viz_data.get("total_laps"),
-                        "total_drivers": viz_data.get("total_drivers"),
-                        "drivers_included": viz_data.get("drivers_included", [])[:5]  # Limit to first 5 drivers
-                    }
-            else:
-                filtered_tool_results[key] = value
-        
-        # Determine query type and use appropriate prompt
-        query_type = query_analysis.get("query_type", "")
-        
-        if has_visualization or query_type == "visualization":
-            summary_prompt = self._get_visualization_prompt(user_query, query_analysis, filtered_tool_results, conversation_context, viz_type)
-        else:
-            summary_prompt = self._get_text_query_prompt(user_query, query_analysis, filtered_tool_results, conversation_context)
-        
-        try:
-            messages = [SystemMessage(content=summary_prompt)]
-            response = self.llm.invoke(messages)
-            answer = response.content
-            
-            return answer
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error generating summary: {e}")
-            # Fallback to basic summary
-            return self._generate_basic_summary(user_query, query_analysis, tool_results)
-
-    def _get_visualization_prompt(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], conversation_context: str, viz_type: str) -> str:
-        """Generate prompt specifically for visualization queries"""
-        return f"""{conversation_context}You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary about the visualization you've created.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Data Retrieved:
-    {json.dumps(filtered_tool_results, indent=2)}
-
-    I have generated a {viz_type} for you to view below.
-
-    VISUALIZATION RESPONSE REQUIREMENTS:
-    1. Start with a friendly, brief introduction about what you've created
-    2. Mention the specific race and session
-    3. Explain what the visualization shows and what insights can be gained
-    4. Mention that graph analysis capabilities will be available soon
-    5. Keep it concise and to the point
-    6. Do NOT mention filenames or technical details
-
-    FORMATTING FOR VISUALIZATIONS:
-    - Be friendly but concise
-    - Do NOT list individual driver names unless specifically asked
-    - Focus on what the visualization shows, not who is included
-    - Use proper line breaks between sections
-    - Keep the tone engaging but factual
-    - Do NOT mention file paths, filenames, or technical implementation details
-
-    Example format:
-    I've created a lap time progression visualization for the Australian Grand Prix 2025 Race that shows how each driver's performance evolved throughout the session.
-
-    The visualization below displays lap time progression for all drivers over the course of the race. You can see how lap times varied throughout the session, including pit stops and any incidents that affected performance.
-
-    Graph analysis capabilities will be available soon to help you dive deeper into the performance data.
-
-    Write your response in a friendly, conversational tone with proper line breaks and formatting.
-    """
-
-    def _get_text_query_prompt(self, user_query: str, query_analysis: Dict[str, Any], filtered_tool_results: Dict[str, Any], conversation_context: str) -> str:
-        """Generate prompt specifically for text-based queries"""
-        
-        # Check if this is a comparison query
-        if query_analysis.get("query_type") == "comparison" and "driver_comparison" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking for a comparison between specific drivers. Focus ONLY on comparing the two drivers mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Driver Comparison Data:
-    {json.dumps(filtered_tool_results.get("driver_comparison", {}), indent=2)}
-
-    DRIVER COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the two specific drivers that were requested
-    2. Present their performance side by side
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Highlight who was faster, more consistent, etc.
-    5. Do NOT mention other drivers or podium finishers unless specifically relevant
-    6. Keep the response focused and concise
-
-    FORMATTING FOR DRIVER COMPARISON:
-    - Start with a brief introduction mentioning the two drivers being compared
-    - Present each driver's key metrics (best lap, average lap, consistency)
-    - Provide a direct comparison highlighting the differences
-    - Keep it factual and focused on the requested comparison
-
-    Example format:
-    Max Verstappen vs Lewis Hamilton - Monaco GP 2025 Race Comparison:
-
-    Max Verstappen (Red Bull Racing):
-    - Best Lap: 01:14.230
-    - Average Lap: 01:17.962
-    - Consistency: 6.904 seconds
-
-    Lewis Hamilton (Ferrari):
-    - Best Lap: 01:14.089
-    - Average Lap: 01:18.075
-    - Consistency: 6.728 seconds
-
-    Comparison: Lewis Hamilton was slightly faster with a best lap of 01:14.089 vs Verstappen's 01:14.230, but Verstappen had a better average lap time.
-
-    Write your response focusing specifically on the requested driver comparison.
-    """
-        elif query_analysis.get("query_type") == "position_analysis" and "position_progression" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking for position progression analysis.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-    Drivers: {query_analysis.get("drivers", [])}
-    Position Progression Data:
-    {json.dumps(filtered_tool_results.get("position_progression", {}), indent=2)}
-
-    POSITION PROGRESSION ANALYSIS RESPONSE REQUIREMENTS:
-    1. Analyze the position changes throughout the race for the specified driver(s)
-    2. Identify key moments when positions changed significantly
-    3. Explain the factors that led to position gains or losses
-    4. Highlight strategic overtakes, pit stops, or incidents that affected positions
-    5. Compare the driver's starting position to their finishing position
-    6. Provide insights on race pace, consistency, and strategic decisions
-    7. Mention any notable battles or defensive driving
-    8. Analyze the overall race strategy and its effectiveness
-
-    TIME FORMATTING REQUIREMENTS:
-    - Convert timestamps to readable format: "Lap X" or "XX minutes into the race"
-    - Use relative time references like "early in the race", "mid-race", "towards the end"
-    - For specific lap references, use "Lap X" format
-    - Avoid raw timestamps like "13:29:16.778"
-    - Use natural language like "around the 15-minute mark" or "with 10 laps remaining"
-
-    ANALYSIS STRUCTURE:
-    - Start with an overview of the driver's race performance
-    - Break down the race into key phases (start, middle, end)
-    - Identify the most significant position changes and their causes
-    - Compare performance to expectations and qualifying position
-    - Provide insights on race strategy and execution
-    - Conclude with an overall assessment of the driver's performance
-
-    EXAMPLE TIME FORMATTING:
-    Instead of: "He moved to 3rd place at 13:29:16.778"
-    Use: "He moved to 3rd place early in the race" or "He moved to 3rd place around Lap 5"
-
-    Instead of: "He dropped to 2nd place at 13:40:42.106"
-    Use: "He dropped to 2nd place during his first pit stop" or "He dropped to 2nd place around the 20-minute mark"
-
-    Write your response focusing specifically on the position progression analysis with properly formatted time references."""
-        
-        elif query_analysis.get("query_type") == "sector_analysis" and "sector_analysis" in filtered_tool_results:
-            # Filter and summarize sector analysis data to reduce token count
-            sector_data = filtered_tool_results.get("sector_analysis", {})
-            if "sector_data" in sector_data:
-                # Extract only the essential information for each driver
-                summarized_data = []
-                for driver_data in sector_data["sector_data"]:
-                    if driver_data.get("driver") and driver_data.get("best_sector1"):
-                        summarized_data.append({
-                            "driver": driver_data["driver"],
-                            "team": driver_data["team"],
-                            "best_sector1": driver_data["best_sector1"],
-                            "best_sector2": driver_data["best_sector2"],
-                            "best_sector3": driver_data["best_sector3"],
-                            "avg_sector1": driver_data.get("avg_sector1"),
-                            "avg_sector2": driver_data.get("avg_sector2"),
-                            "avg_sector3": driver_data.get("avg_sector3")
-                        })
-                
-                sector_data["sector_data"] = summarized_data
-
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking for a sector comparison between specific drivers. Focus ONLY on comparing the sector performance of the drivers mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Sector Analysis Data:
-    {json.dumps(sector_data, indent=2)}
-
-    SECTOR COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the sector performance of the specific drivers requested
-    2. Present their sector times side by side for each sector (Sector 1, Sector 2, Sector 3)
-    3. Convert sector times from seconds to MM:SS.mmm format (e.g., 28.701 seconds becomes 00:28.701)
-    4. Highlight which driver was faster in each sector
-    5. Identify each driver's strongest and weakest sectors
-    6. Do NOT mention other drivers unless specifically relevant
-    7. Keep the response focused and concise
-
-    FORMATTING FOR SECTOR COMPARISON:
-    - Start with a brief introduction mentioning the two drivers being compared
-    - Present each driver's best sector times for all three sectors
-    - Provide a direct comparison highlighting the differences in each sector
-    - Identify which driver was faster in each sector
-    - Keep it factual and focused on the requested sector comparison
-
-    Example format:
-    Charles Leclerc vs Lando Norris - British GP 2025 Sector Comparison:
-
-    Charles Leclerc (Ferrari):
-    - Best Sector 1: 00:28.701
-    - Best Sector 2: 00:36.674
-    - Best Sector 3: 00:24.312
-
-    Lando Norris (McLaren):
-    - Best Sector 1: 00:28.747
-    - Best Sector 2: 00:36.673
-    - Best Sector 3: 00:24.312
-
-    Comparison: Charles Leclerc was faster in Sector 1 by 0.046 seconds, while Lando Norris was faster in Sector 2 by 0.001 seconds. Both drivers were equally fast in Sector 3.
-
-    Write your response focusing specifically on the requested sector comparison.
-    """
-        elif query_analysis.get("query_type") == "comparison" and "team_comparison" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking for a comparison between specific teams. Focus ONLY on comparing the two teams mentioned.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Team Comparison Data:
-    {json.dumps(filtered_tool_results.get("team_comparison", {}), indent=2)}
-
-    TEAM COMPARISON RESPONSE REQUIREMENTS:
-    1. Focus ONLY on comparing the two specific teams that were requested
-    2. Present their performance side by side
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Highlight which team was faster, more consistent, etc.
-    5. Include individual driver performance within each team
-    6. Do NOT mention other teams or podium finishers unless specifically relevant
-    7. Keep the response focused and concise
-
-    FORMATTING FOR TEAM COMPARISON:
-    - Start with a brief introduction mentioning the two teams being compared
-    - Present each team's overall performance (total laps, average lap, best lap, consistency)
-    - Include individual driver performance within each team
-    - Provide a direct comparison highlighting the differences
-    - Keep it factual and focused on the requested team comparison
-
-    Example format:
-    Mercedes vs Red Bull Racing - Monaco GP 2025 Race Comparison:
-
-    Mercedes:
-    - Total Laps: 151
-    - Average Lap: 01:20.194
-    - Best Lap: 01:13.404
-    - Consistency: 6.441 seconds
-    - Best Position: 11th
-    - Drivers: George Russell (best lap: 01:13.404) and Kimi Antonelli (best lap: 01:13.518)
-
-    Red Bull Racing:
-    - Total Laps: 154
-    - Average Lap: 01:19.028
-    - Best Lap: 01:14.230
-    - Consistency: 6.404 seconds
-    - Best Position: 4th
-    - Drivers: Max Verstappen (best lap: 01:14.230) and Yuki Tsunoda (best lap: 01:14.913)
-
-    Comparison: Red Bull Racing had better overall performance with a lower average lap time and better finishing positions, while Mercedes showed slightly better consistency.
-
-    Write your response focusing specifically on the requested team comparison.
-    """
-
-        # Check if this is a driver performance query
-        elif query_analysis.get("query_type") == "driver_performance" and "driver_performance" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking about a specific driver's performance. Focus ONLY on that driver's performance data.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Driver Performance Data:
-    {json.dumps(filtered_tool_results.get("driver_performance", {}), indent=2)}
-
-    DRIVER PERFORMANCE RESPONSE REQUIREMENTS:
-    1. Focus ONLY on the specific driver's performance that was requested
-    2. Include their total laps, average lap time, best lap time, and consistency
-    3. Convert lap times from seconds to MM:SS.mmm format (e.g., 77.962 seconds becomes 01:17.962)
-    4. Mention their team and any notable aspects of their performance
-    5. Do NOT mention other drivers unless specifically relevant to the requested driver's performance
-    6. Keep the response focused and concise
-
-    FORMATTING FOR DRIVER PERFORMANCE:
-    - Start with the driver's name and team
-    - Include their total laps completed
-    - Show their best lap time and average lap time in MM:SS.mmm format
-    - Mention consistency if notable
-    - Keep it factual and focused on the requested driver
-
-    Example format:
-    Max Verstappen (Red Bull Racing) completed 78 laps in the Monaco Grand Prix 2025 Race. His best lap was 01:14.230 and his average lap time was 01:17.962. He showed good consistency with a standard deviation of 6.904 seconds across all his laps.
-
-    Write your response focusing specifically on the requested driver's performance.
-    """
-        elif query_analysis.get("query_type") == "tire_strategy" and "tire_strategy" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking about tire strategy analysis. Focus on the tire strategy data and stint information.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Tire Strategy Data:
-    {json.dumps(filtered_tool_results.get("tire_strategy", {}), indent=2)}
-
-    TIRE STRATEGY RESPONSE REQUIREMENTS:
-    1. Focus on tire compound usage, stint lengths, and strategy decisions
-    2. Include information about tire compounds used (Soft, Medium, Hard)
-    3. Mention stint durations and any notable tire management
-    4. If specific teams/drivers were requested, focus on their tire strategy
-    5. Include any pit stop timing related to tire changes
-    6. Keep the response focused and concise
-
-    FORMATTING FOR TIRE STRATEGY:
-    - Start with an overview of tire strategy for the session
-    - Include information about compounds used and stint lengths
-    - If comparing teams/drivers, show their tire strategy side by side
-    - Mention any notable tire management or strategy decisions
-    - Keep it factual and focused on tire strategy
-
-    Example format:
-    For the Monaco Grand Prix 2025 Race, the tire strategy involved primarily Medium and Hard compounds. Most drivers opted for a two-stop strategy, with the first stint averaging 25 laps on Medium tires.
-
-    Write your response focusing specifically on tire strategy and compound usage.
-    """
-        
-        elif query_analysis.get("query_type") == "pit_strategy" and "pit_stop_analysis" in filtered_tool_results:
-            return f"""{conversation_context}You are an expert F1 analyst. The user is asking about pit stop strategy analysis. Focus on the pit stop data and strategy insights.
-
-        User Query: {user_query}
-        Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-        Session: {query_analysis["session_type"]}
-
-        Pit Stop Analysis Data:
-        {json.dumps(filtered_tool_results.get("pit_stop_analysis", {}), indent=2)}
-
-        PIT STRATEGY RESPONSE REQUIREMENTS:
-        1. Focus on pit stop timing, frequency, and strategy
-        2. Include total pit stops, average pit stop duration, and fastest pit stops
-        3. Convert times from seconds to MM:SS.mmm format (e.g., 2.5 seconds becomes 00:02.500)
-        4. Mention any notable pit stop strategies or timing decisions
-        5. If specific teams/drivers were requested, focus on their pit stop performance
-        6. Keep the response focused and concise
-
-        FORMATTING FOR PIT STRATEGY:
-        - Start with an overview of pit stop activity
-        - Include total number of pit stops and average duration
-        - Highlight fastest pit stops and any notable strategies
-        - If comparing teams/drivers, show their pit stop performance side by side
-        - Keep it factual and focused on pit stop strategy
-
-        Example format:
-        For the Monaco Grand Prix 2025 Race, there were 15 pit stops with an average duration of 00:02.847 seconds. The fastest pit stop was completed by Red Bull Racing in 00:02.123 seconds.
-
-        Write your response focusing specifically on pit stop strategy and timing.
-        """
-        # Default prompt for other query types
-        else:
-            return f"""{conversation_context}You are an expert F1 analyst. Based on the following data, provide a friendly and informative summary that directly answers the user's question.
-
-    User Query: {user_query}
-    Race: {query_analysis["meeting_info"]["name"]} {query_analysis["meeting_info"]["year"]}
-    Session: {query_analysis["session_type"]}
-
-    Data Retrieved:
-    {json.dumps(filtered_tool_results, indent=2)}
-
-    TEXT QUERY RESPONSE REQUIREMENTS:
-    1. Directly answer the user's question in a friendly, conversational tone
-    2. Include specific numbers, times, and positions
-    3. Use clear, factual language but be engaging
-    4. Convert lap times from seconds to MM:SS.mmm format (e.g., 93.614 seconds becomes 01:33.614)
-    5. Mention significant gaps only if noteworthy
-    6. Provide context and insights about the results
-
-    FORMATTING FOR TEXT QUERIES:
-    - Be friendly and conversational while staying factual
-    - Avoid overly dramatic phrases like "thrilling", "spectacular", "vibrant skies", "edge of their seats"
-    - Focus on facts: who, what times, what positions
-    - When displaying lap times, use MM:SS.mmm format
-    - If multiple fastest laps are provided, list them in order as a list with each entry as a new line from fastest to slowest
-    - Use proper line breaks and spacing for readability
-    - Provide additional context and insights when relevant
-
-    IMPORTANT: When displaying lap times, use the format MM:SS.mmm (e.g., 01:33.614, 01:30.000, 01:35.123). Do NOT mix words and numbers for times.
-
-    Example format:
-    For the Australian Grand Prix 2025 Race, here are the fastest lap times:
-
-    1. Charles Leclerc (Ferrari) - 01:24.567
-    2. Carlos Sainz (Ferrari) - 01:24.789
-    3. Esteban Ocon (Alpine) - 01:25.123
-
-    Charles Leclerc set the fastest lap of the session, with his Ferrari teammate Carlos Sainz close behind. The Alpine of Esteban Ocon rounded out the top three, showing strong pace throughout the session.
-
-    Write your response in a direct, professional tone with proper line breaks and formatting.
-    """
+        return suggestions
 
     def _get_conversation_context(self) -> str:
         """Get recent conversation context for the LLM (like your notebook)"""
@@ -2331,6 +1990,47 @@ class ReasoningEngine(BaseComponent):
         
         return context
     
+    def _generate_token_limit_error_response(self, user_query: str, query_analysis: Dict[str, Any]) -> str:
+        """Generate a helpful response when the token limit is exceeded"""
+        
+        query_type = query_analysis.get("query_type", "")
+        meeting_info = query_analysis.get("meeting_info", {})
+        drivers = query_analysis.get("drivers", [])
+        teams = query_analysis.get("teams", [])
+        
+        # Build helpful suggestions based on the query type
+        suggestions = []
+        
+        if query_type in ["sector_analysis", "visualization"]:
+            if drivers:
+                suggestions.append(f"focus on a specific driver like '{drivers[0]}'")
+            suggestions.append("limit to a specific range of laps (e.g., 'laps 1-20')")
+            suggestions.append("focus on a specific sector (e.g., 'sector 1 analysis')")
+        elif query_type in ["position_analysis", "lap_time_progression"]:
+            if drivers:
+                suggestions.append(f"compare just two drivers like '{drivers[0]} vs {drivers[1] if len(drivers) > 1 else 'another driver'}'")
+            suggestions.append("focus on a specific time period in the race")
+        elif query_type in ["pit_strategy", "tire_strategy"]:
+            if drivers:
+                suggestions.append(f"focus on a specific driver like '{drivers[0]}'")
+            if teams:
+                suggestions.append(f"focus on a specific team like '{teams[0]}'")
+        else:
+            suggestions.append("focus on a specific driver or team")
+            suggestions.append("limit to a specific time period")
+        
+        meeting_name = meeting_info.get("name", "this race")
+        
+        response = f"I found too much data for {meeting_name} to process at once. The dataset is quite large and exceeded my processing limits.\n\n"
+        response += "Can you try a more specific query like:\n"
+        
+        for suggestion in suggestions[:3]:  # Limit to 3 suggestions
+            response += f"• {suggestion}\n"
+        
+        response += "\nThis will help me provide you with more focused and useful information!"
+        
+        return response
+
     def _generate_basic_summary(self, user_query: str, query_analysis: Dict[str, Any], tool_results: Dict[str, Any]) -> str:
         """Generate a basic summary if LLM fails"""
         
