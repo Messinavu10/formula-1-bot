@@ -13,7 +13,7 @@ import concurrent.futures
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.entity.mcp_config_entity import MCPConfig
-from formula_one.utils.query_validator import QueryValidator, ValidationResult
+from src.formula_one.utils.query_validator import QueryValidator, ValidationResult
 
 from src.formula_one.components.enhanced_context_memory import EnhancedContextManager
 
