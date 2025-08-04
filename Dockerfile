@@ -37,9 +37,9 @@ RUN chmod +x /app/start.sh
 # Expose port (Railway will set PORT environment variable)
 EXPOSE $PORT
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:$PORT/api/health || exit 1
+# # Health check
+# HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+#     CMD curl -f http://localhost:$PORT/api/health || exit 1
 
 # Default command (will be overridden by docker-compose or Railway)
 CMD ["python", "app.py"]
