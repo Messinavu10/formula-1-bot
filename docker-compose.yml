@@ -1,0 +1,95 @@
+# Docker Compose configuration for F1 Racing Assistant
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: f1_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-f1_racing}
+      POSTGRES_USER: ${DB_USER:-f1_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-f1_password}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-f1_user} -d ${DB_NAME:-f1_racing}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - f1_network
+    restart: unless-stopped
+
+  # F1 Racing Assistant Application
+  f1_app:
+    build: .
+    container_name: f1_racing_assistant
+    environment:
+      # Database configuration
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-f1_racing}
+      DB_USER: ${DB_USER:-f1_user}
+      DB_PASSWORD: ${DB_PASSWORD:-f1_password}
+      
+      # OpenAI API Key (required)
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      
+      # Optional: LangSmith API Key
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      
+      # Application settings
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+      
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - f1_network
+    restart: unless-stopped
+    command: ["./start.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: Nginx reverse proxy (for production)
+  nginx:
+    image: nginx:alpine
+    container_name: f1_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - f1_app
+    networks:
+      - f1_network
+    restart: unless-stopped
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  f1_network:
+    driver: bridge 

@@ -6,7 +6,7 @@ from typing import Dict, List, Any, Optional
 from src.formula_one.logging import logger
 from src.formula_one.components.data_ingestion import DatabaseIngestion
 from src.formula_one.entity.config_entity import DataValidationConfig, DatabaseConfig
-from formula_one.utils.validation_utils import ValidationUtils
+from src.formula_one.utils.validation_utils import ValidationUtils
 from src.formula_one.components.base_component import BaseComponent
 
 class RawDataValidator(BaseComponent):

@@ -26,3 +26,6 @@ nest_asyncio
 fastapi
 uvicorn
 chromadb
+jinja2
+python-multipart
+kaleido

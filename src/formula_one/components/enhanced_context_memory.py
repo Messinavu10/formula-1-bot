@@ -22,8 +22,8 @@ class EnhancedContextManager(BaseComponent):
         """Add to conversation history"""
         entry = {
             "timestamp": datetime.now().isoformat(),
-            "message": message,
-            "response": response
+            "user_message": message,
+            "bot_response": response
         }
         self.conversation_history.append(entry)
         
@@ -83,7 +83,7 @@ class EnhancedContextManager(BaseComponent):
         if len(user_query.strip()) <= 3:
             return False
         
-        last_response = self.conversation_history[-1]["response"]
+        last_response = self.conversation_history[-1].get("bot_response", self.conversation_history[-1].get("response", ""))
         
         # More specific clarification patterns that clearly indicate a request for clarification
         clarification_patterns = [

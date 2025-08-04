@@ -148,8 +148,9 @@ class IntentAnalyzer(BaseComponent):
             recent_context = conversation_history[-3:]  # Last 3 exchanges
             context_prompt = f"\nRecent conversation context:\n"
             for exchange in recent_context:
-                context_prompt += f"User: {exchange.get('query', '')}\n"
-                context_prompt += f"Assistant: {exchange.get('response', '')[:100]}...\n"
+                context_prompt += f"User: {exchange.get('user_message', exchange.get('query', ''))}\n"
+                response_text = exchange.get('bot_response', exchange.get('response', ''))
+                context_prompt += f"Assistant: {response_text[:100]}...\n"
         
         classification_prompt = f"""You are an expert F1 data analyst. Classify the user's intent from the following query.
 
@@ -252,7 +253,10 @@ Intent:"""
             'silverstone': 'British Grand Prix',
             'great britain': 'British Grand Prix',
             'belgian': 'Belgian Grand Prix',
-            'spa': 'Belgian Grand Prix'
+            'spa': 'Belgian Grand Prix',
+            'hungarian': 'Hungarian Grand Prix',
+            'hungary': 'Hungarian Grand Prix',
+            'hungarian grand prix': 'Hungarian Grand Prix'
         }
         
         query_lower = query.lower()
@@ -304,7 +308,7 @@ Intent:"""
             return {"name": None, "year": 2025}
         
         for entry in reversed(conversation_history[-3:]):
-            previous_meeting = self._extract_meeting_info(entry["message"])
+            previous_meeting = self._extract_meeting_info(entry.get("user_message", entry.get("message", "")))
             if previous_meeting["name"]:
                 self.logger.info(f"Using context from previous query: {previous_meeting['name']}")
                 return previous_meeting
@@ -701,7 +705,7 @@ class ReasoningEngine(BaseComponent):
                 self.logger.info(f"🔍 Last conversation entry: {conversation_history[-1]}")
                 
                 # Check if the last response was asking for clarification
-                last_response = conversation_history[-1].get("response", "")
+                last_response = conversation_history[-1].get("bot_response", conversation_history[-1].get("response", ""))
                 self.logger.info(f"🔍 Last response contains clarification patterns: {any(pattern in last_response for pattern in ['Could you please specify', 'I cannot identify'])}")
             
             # Check if this is a clarification response to a previous query
@@ -710,10 +714,11 @@ class ReasoningEngine(BaseComponent):
                 self.logger.info(f"🔍 Detected clarification response: {user_query}")
                 self.logger.info(f"🔍 Conversation history length: {len(conversation_history)}")
                 if conversation_history:
-                    self.logger.info(f"🔍 Last response: {conversation_history[-1].get('response', '')[:200]}")
+                    last_response_text = conversation_history[-1].get('bot_response', conversation_history[-1].get('response', ''))
+                self.logger.info(f"🔍 Last response: {last_response_text[:200]}")
                 
                 # Check what type of clarification this is
-                last_response = conversation_history[-1].get("response", "")
+                last_response = conversation_history[-1].get("bot_response", conversation_history[-1].get("response", ""))
                 clarification_context = self.context_manager.get_clarification_context()
                 
                 # Check if this is a visualization vs summary clarification response FIRST
@@ -1983,9 +1988,10 @@ to clarify whether they want a visualization or text analysis. Be conversational
         
         context = "Recent conversation context:\n"
         for entry in self.context_manager.conversation_history[-2:]:  # Last 2 exchanges
-            context += f"User: {entry['message']}\n"
+            context += f"User: {entry.get('user_message', entry.get('message', ''))}\n"
             # Truncate response to avoid too much context
-            response_preview = entry['response'][:200] + "..." if len(entry['response']) > 200 else entry['response']
+            response_text = entry.get('bot_response', entry.get('response', ''))
+            response_preview = response_text[:200] + "..." if len(response_text) > 200 else response_text
             context += f"Assistant: {response_preview}\n\n"
         
         return context

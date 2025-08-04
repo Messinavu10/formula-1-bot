@@ -1,11 +1,12 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import logging
 from pathlib import Path
 from collections import defaultdict
@@ -14,13 +15,23 @@ from collections import defaultdict
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("_client").setLevel(logging.WARNING)
 
-# Import your MCP pipeline
+# Import your MCP pipeline and session manager
 from src.formula_one.pipeline.mcp_pipeline import MCPTrainingPipeline
+from src.formula_one.utils.session_manager import session_manager
 
 app = FastAPI(
     title="F1 Racing Assistant",
     description="Your AI-powered Formula 1 racing assistant",
     version="2.0.0"
+)
+
+# Add CORS middleware for multi-user support
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Mount templates and static files
@@ -38,8 +49,8 @@ app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 # Initialize MCP pipeline
 mcp_pipeline = None
 
-# Session management - store conversation history per session
-session_conversations = defaultdict(list)
+# Global MCP pipeline instance
+mcp_pipeline = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -71,11 +82,12 @@ async def home(request: Request):
 
 @app.post("/api/chat")
 async def chat_endpoint(request: Request):
-    """Handle chat requests"""
+    """Handle chat requests with session management"""
     try:
         data = await request.json()
         user_message = data.get("message", "").strip()
-        session_id = data.get("session_id", "default")
+        session_id = data.get("session_id")
+        user_id = data.get("user_id")
         
         if not user_message:
             return {"error": "Message cannot be empty"}
@@ -83,8 +95,15 @@ async def chat_endpoint(request: Request):
         if not mcp_pipeline:
             return {"error": "F1 Assistant is not ready. Please try again."}
         
+        # Create session if it doesn't exist
+        if not session_id or not session_manager.validate_session(session_id):
+            session_id = session_manager.create_session(user_id)
+        
+        # Update session activity
+        session_manager.update_session_activity(session_id)
+        
         # Get conversation history for this session
-        conversation_history = session_conversations[session_id]
+        conversation_history = session_manager.get_conversation_history(session_id)
         
         # Update the reasoning engine's context manager with the session history
         mcp_pipeline.reasoning_engine.context_manager.conversation_history = conversation_history
@@ -103,11 +122,16 @@ async def chat_endpoint(request: Request):
             response = result
             visualization_data = None
         
-        # Update session history with the new exchange
-        session_conversations[session_id] = mcp_pipeline.reasoning_engine.context_manager.conversation_history
+        # Add conversation entry to session
+        session_manager.add_conversation_entry(
+            session_id, 
+            user_message, 
+            response, 
+            {"visualization": visualization_data}
+        )
         
         # Add debug logging
-        print(f"🔍 Session {session_id}: Updated to {len(session_conversations[session_id])} conversation entries")
+        print(f"🔍 Session {session_id}: Updated conversation history")
         
         # Add debug logging for visualization data
         if visualization_data:
@@ -118,6 +142,7 @@ async def chat_endpoint(request: Request):
         return {
             "response": response,
             "visualization": visualization_data,
+            "session_id": session_id,
             "timestamp": asyncio.get_event_loop().time()
         }
         
@@ -143,5 +168,67 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": asyncio.get_event_loop().time()}
 
+@app.post("/api/session/create")
+async def create_session(user_id: Optional[str] = None):
+    """Create a new session"""
+    try:
+        session_id = session_manager.create_session(user_id)
+        return {
+            "session_id": session_id,
+            "user_id": user_id,
+            "status": "created"
+        }
+    except Exception as e:
+        logging.error(f"Error creating session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create session")
+
+@app.get("/api/session/{session_id}/validate")
+async def validate_session(session_id: str):
+    """Validate if a session exists and is active"""
+    is_valid = session_manager.validate_session(session_id)
+    return {
+        "session_id": session_id,
+        "is_valid": is_valid
+    }
+
+@app.delete("/api/session/{session_id}")
+async def end_session(session_id: str):
+    """End a session"""
+    try:
+        session_manager.end_session(session_id)
+        return {
+            "session_id": session_id,
+            "status": "ended"
+        }
+    except Exception as e:
+        logging.error(f"Error ending session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to end session")
+
+@app.get("/api/session/stats")
+async def get_session_stats():
+    """Get session statistics"""
+    try:
+        stats = session_manager.get_session_stats()
+        return stats
+    except Exception as e:
+        logging.error(f"Error getting session stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get session stats")
+
+@app.get("/api/session/user/{user_id}")
+async def get_user_sessions(user_id: str):
+    """Get all sessions for a user"""
+    try:
+        session_ids = session_manager.get_user_sessions(user_id)
+        return {
+            "user_id": user_id,
+            "session_ids": session_ids,
+            "count": len(session_ids)
+        }
+    except Exception as e:
+        logging.error(f"Error getting user sessions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get user sessions")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    import os
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)

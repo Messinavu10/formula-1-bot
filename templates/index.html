@@ -555,7 +555,7 @@
                 this.themeIcon = document.getElementById('theme-icon');
                 this.themeText = document.getElementById('theme-text');
                 this.isProcessing = false;
-                this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                this.sessionId = null; // Will be set by the server
                 
                 // Initialize the chatbot
                 this.init();
@@ -700,6 +700,11 @@
                     if (data.error) {
                         this.addMessage(`Error: ${data.error}`, 'bot');
                     } else {
+                        // Update session ID if provided by server
+                        if (data.session_id) {
+                            this.sessionId = data.session_id;
+                        }
+                        
                         this.addMessage(data.response, 'bot');
                         
                         // Handle visualization if present
