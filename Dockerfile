@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create necessary directories
-RUN mkdir -p artifacts/visualizations logs
+RUN mkdir -p artifacts/visualizations logs assets
 
 # Set permissions
 RUN chmod +x /app/start.sh
