@@ -16,6 +16,7 @@ from src.formula_one.entity.mcp_config_entity import MCPConfig
 from src.formula_one.utils.query_validator import QueryValidator, ValidationResult
 
 from src.formula_one.components.enhanced_context_memory import EnhancedContextManager
+from src.formula_one.components.chart_analysis import ChartAnalyzer
 
 
 class IntentAnalyzer(BaseComponent):
@@ -86,6 +87,12 @@ class IntentAnalyzer(BaseComponent):
                 "plot the data", "graph the results", "show me the progression",
                 "visualize the data", "create a diagram", "show me the analysis",
                 "show me"
+            ],
+            "chart_analysis": [
+                "analyze this chart", "what does this chart show", "explain this visualization",
+                "what can you tell me about this chart", "interpret this graph",
+                "what insights can you provide", "analyze the data", "chart analysis",
+                "what patterns do you see", "explain the trends", "what's happening in this chart"
             ]
         }
 
@@ -404,7 +411,20 @@ Intent:"""
         # Add debugging
         self.logger.info(f"🔍 Determining query type for: '{query_lower}'")
         
-        # First, check for visualization keywords (highest priority)
+        # First, check for chart analysis keywords (highest priority)
+        chart_analysis_keywords = [
+            "analyze this chart", "what does this chart show", "explain this visualization",
+            "what can you tell me about this chart", "interpret this graph",
+            "what insights can you provide", "analyze the data", "chart analysis",
+            "what patterns do you see", "explain the trends", "what's happening in this chart"
+        ]
+        
+        for keyword in chart_analysis_keywords:
+            if keyword in query_lower:
+                self.logger.info(f"✅ Matched chart analysis keyword: '{keyword}'")
+                return "chart_analysis"
+        
+        # Check for visualization keywords (high priority)
         viz_keywords = [
             "show me a graph", "create a chart", "visualize", "plot", "graph",
             "show me the data", "display", "chart", "visualization", "graphical",
@@ -658,6 +678,9 @@ class ReasoningEngine(BaseComponent):
         self.http_client = http_client
         self.intent_analyzer = IntentAnalyzer(config, db_config)
         self.context_manager = EnhancedContextManager(config, db_config)  # Use enhanced context manager
+        
+        # Initialize chart analyzer
+        self.chart_analyzer = ChartAnalyzer(config, db_config)
 
         self.logger.info(f"🔍 Config openai_api_key type: {type(config.openai_api_key)}")
         self.logger.info(f"🔍 Config openai_api_key value: {config.openai_api_key}")
@@ -1162,15 +1185,14 @@ class ReasoningEngine(BaseComponent):
         
         has_visualization = False
         viz_data = None
+        viz_type = None
+        
         for tool_name in visualization_tools:
             if tool_name in tool_results and tool_results[tool_name].get("success"):
                 has_visualization = True
                 viz_data = tool_results[tool_name]
+                viz_type = tool_name.replace("create_", "")
                 break
-        
-        viz_type = "data visualization"
-        if viz_data:
-            viz_type = viz_data.get("visualization_type", "data visualization")
         
         # Create filtered tool results for LLM
         filtered_tool_results = self._filter_tool_results_for_llm(tool_results)
@@ -1180,11 +1202,33 @@ class ReasoningEngine(BaseComponent):
             self.logger.info(f"🔍 Visualization detected: {viz_data}")
             self.logger.info(f"🔍 Filtered tool results for LLM: {filtered_tool_results}")
         
-        # Determine query type and use appropriate prompt
+        # If visualization was generated, analyze it
+        if has_visualization and viz_data:
+            self.logger.info(f"🔍 Analyzing generated {viz_type} chart")
+            chart_analysis = self.chart_analyzer.analyze_chart(viz_data, viz_type, user_query)
+            
+            # Generate base response
+            try:
+                summary_prompt = self._get_enhanced_visualization_prompt(user_query, query_analysis, filtered_tool_results, conversation_context, viz_type)
+                messages = [SystemMessage(content=summary_prompt)]
+                response = self.llm.invoke(messages)
+                base_response = response.content
+                
+                # Combine base response with chart analysis
+                combined_response = f"{base_response}\n\n📊 **Chart Analysis:**\n{chart_analysis}"
+                
+                return combined_response
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error in combined response generation: {e}")
+                # Fallback to just chart analysis
+                return f"I've generated a {viz_type} visualization for you.\n\n📊 **Chart Analysis:**\n{chart_analysis}"
+        
+        # For non-visualization responses, use the original logic
         query_type = query_analysis.get("query_type", "")
         
-        if has_visualization or query_type == "visualization":
-            summary_prompt = self._get_enhanced_visualization_prompt(user_query, query_analysis, filtered_tool_results, conversation_context, viz_type)
+        if query_type == "visualization":
+            summary_prompt = self._get_enhanced_visualization_prompt(user_query, query_analysis, filtered_tool_results, conversation_context, "data visualization")
         else:
             summary_prompt = self._get_enhanced_text_prompt(user_query, query_analysis, filtered_tool_results, conversation_context)
         
@@ -1192,10 +1236,6 @@ class ReasoningEngine(BaseComponent):
             messages = [SystemMessage(content=summary_prompt)]
             response = self.llm.invoke(messages)
             answer = response.content
-            
-            # If visualization was generated, keep the response clean and natural
-            # The visualization will be displayed by the frontend automatically
-            # No need to add technical metadata to the response
             
             return answer
             
@@ -1586,6 +1626,13 @@ class ReasoningEngine(BaseComponent):
                     "meeting_key": "placeholder",
                     "session_key": "placeholder"
                 }
+        elif query_type == "chart_analysis":
+            # For chart analysis, we need to get the last visualization from context
+            # This will be handled by the reasoning engine
+            tools_needed["analyze_last_chart"] = {
+                "analysis_type": "comprehensive",
+                "user_query": query_analysis.get("original_query", "")
+            }
         else:
             # Default to race results
             tools_needed["get_race_results"] = {

@@ -4,6 +4,7 @@ import time
 from src.formula_one.components.base_component import BaseComponent
 from src.formula_one.entity.mcp_config_entity import ToolResult
 from src.formula_one.entity.config_entity import DatabaseConfig
+from src.formula_one.components.chart_analysis import ChartAnalyzer
 
 class BaseMCPTool(BaseComponent, ABC):
     """Base class for all MCP tools"""
@@ -1559,4 +1560,52 @@ class GetTeamDriversTool(BaseMCPTool):
                 data={},
                 error=str(e),
                 execution_time=execution_time
+            )
+
+
+class AnalyzeLastChartTool(BaseMCPTool):
+    """Analyze the last generated chart"""
+    category = "chart_analysis"
+    
+    def __init__(self, config, db_config: DatabaseConfig, db_connection, query_builder, chart_analyzer):
+        super().__init__(config, db_config, db_connection, query_builder)
+        self.chart_analyzer = chart_analyzer
+    
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        """Analyze the last generated chart"""
+        start_time = time.time()
+        
+        try:
+            # Get the last visualization from context
+            # This would need to be passed from the reasoning engine
+            last_viz_data = params.get("last_visualization")
+            user_query = params.get("user_query", "")
+            
+            if not last_viz_data:
+                return ToolResult(
+                    success=False,
+                    data={},
+                    error="No chart available for analysis",
+                    execution_time=time.time() - start_time
+                )
+            
+            # Analyze the chart
+            analysis = self.chart_analyzer.analyze_chart(
+                last_viz_data, 
+                last_viz_data.get("visualization_type", "unknown"),
+                user_query
+            )
+            
+            return ToolResult(
+                success=True,
+                data={"analysis": analysis},
+                execution_time=time.time() - start_time
+            )
+            
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data={},
+                error=str(e),
+                execution_time=time.time() - start_time
             )

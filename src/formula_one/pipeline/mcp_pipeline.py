@@ -4,7 +4,7 @@ from src.formula_one.entity.config_entity import DatabaseConfig
 from src.formula_one.components.mcp_tools import (
     GetMeetingKeyTool, GetSessionKeyTool, GetDriverPerformanceTool, GetTeamPerformanceTool, CompareDriversTool,CompareTeamsTool, GetRaceResultsTool,
     GetQualifyingResultsTool, GetPitStopAnalysisTool, GetTireStrategyTool, InvestigateIncidentTool, GetPositionProgressionTool, GetSectorAnalysisTool,
-    GetSessionInfoTool, ExploreSchemaTool, GetFastestLapTool, GetTeamDriversTool
+    GetSessionInfoTool, ExploreSchemaTool, GetFastestLapTool, GetTeamDriversTool, AnalyzeLastChartTool
 )
 from src.formula_one.components.mcp_visualization_tools import (
     CreateLapTimeProgressionTool, CreatePositionProgressionTool, 
@@ -13,6 +13,7 @@ from src.formula_one.components.mcp_visualization_tools import (
 from src.formula_one.components.mcp_server import FastAPIServer
 from src.formula_one.components.mcp_client import HTTPMCPClient
 from src.formula_one.components.mcp_reasoning import ReasoningEngine
+from src.formula_one.components.chart_analysis import ChartAnalyzer
 from src.formula_one.utils.database_utils import DatabaseUtils
 from src.formula_one.config.configuration import ConfigurationManager
 
@@ -43,6 +44,9 @@ class MCPTrainingPipeline:
         self.db_utils = DatabaseUtils(self.db_config)
         self.schema_info = self.db_utils.get_schema_info()
         
+        # Initialize chart analyzer
+        self.chart_analyzer = ChartAnalyzer(self.config, self.db_config)
+        
         # Initialize tools
         self.tools = {
             "get_meeting_key": GetMeetingKeyTool(self.config, self.db_config, self.db_utils, self.query_builder),
@@ -66,7 +70,8 @@ class MCPTrainingPipeline:
             "create_sector_analysis": CreateSectorAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "create_pit_stop_analysis": CreatePitStopAnalysisTool(self.config, self.db_config, self.db_utils, self.query_builder),
             "create_tire_strategy": CreateTireStrategyTool(self.config, self.db_config, self.db_utils, self.query_builder),
-            "get_team_drivers": GetTeamDriversTool(self.config, self.db_config, self.db_utils, self.query_builder)
+            "get_team_drivers": GetTeamDriversTool(self.config, self.db_config, self.db_utils, self.query_builder),
+            "analyze_last_chart": AnalyzeLastChartTool(self.config, self.db_config, self.db_utils, self.query_builder, self.chart_analyzer)
         }
         
         # Initialize server

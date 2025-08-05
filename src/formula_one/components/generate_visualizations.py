@@ -73,8 +73,8 @@ class VisualizationGenerator(BaseComponent):
     def _save_visualization(self, fig: go.Figure, filepath: str) -> str:
         """Save visualization and return base64 encoded image"""
         try:
-            # Save as HTML
-            fig.write_html(filepath, include_plotlyjs='cdn')
+            # Save as HTML with responsive sizing
+            fig.write_html(filepath, include_plotlyjs='cdn', config={'responsive': True})
             
             # Convert to base64 for ML model consumption
             img_bytes = fig.to_image(format="png", width=1200, height=800)
@@ -177,7 +177,7 @@ class VisualizationGenerator(BaseComponent):
                                     '<extra></extra>'
                     ))
             
-            # Update layout
+            # Update layout with responsive sizing
             fig.update_layout(
                 title=f"Lap Time Progression",
                 xaxis_title="Lap Number",
@@ -185,13 +185,18 @@ class VisualizationGenerator(BaseComponent):
                 template="plotly_dark",
                 plot_bgcolor=self.f1_colors['dark'],
                 paper_bgcolor=self.f1_colors['dark'],
-                font=dict(color='white'),
+                font=dict(color='white', size=14),
+                height=600,
+                width=None,  # Let it be responsive
                 hovermode='closest',
                 legend=dict(
                     bgcolor=self.f1_colors['light'],
                     bordercolor=self.f1_colors['primary'],
                     borderwidth=1
-                )
+                ),
+                # Make the chart responsive
+                autosize=True,
+                margin=dict(l=50, r=50, t=80, b=50)
             )
             
             # Save visualization
@@ -343,7 +348,7 @@ class VisualizationGenerator(BaseComponent):
                 paper_bgcolor=self.f1_colors['dark'],
                 font=dict(color='white', size=14),
                 height=600,
-                width=1200,
+                width=None,  # Let it be responsive
                 yaxis=dict(
                     autorange='reversed',  # Position 1 at top
                     tickmode='linear',
@@ -356,7 +361,10 @@ class VisualizationGenerator(BaseComponent):
                     bgcolor=self.f1_colors['light'],
                     bordercolor=self.f1_colors['primary'],
                     borderwidth=1
-                )
+                ),
+                # Make the chart responsive
+                autosize=True,
+                margin=dict(l=50, r=50, t=80, b=50)
             )
             
             # Save visualization
@@ -532,14 +540,18 @@ class VisualizationGenerator(BaseComponent):
                 template="plotly_dark",
                 plot_bgcolor=self.f1_colors['dark'],
                 paper_bgcolor=self.f1_colors['dark'],
-                font=dict(color='white'),
+                font=dict(color='white', size=14),
                 height=800,
+                width=None,  # Let it be responsive
                 showlegend=True,
                 legend=dict(
                     bgcolor=self.f1_colors['light'],
                     bordercolor=self.f1_colors['primary'],
                     borderwidth=1
-                )
+                ),
+                # Make the chart responsive
+                autosize=True,
+                margin=dict(l=50, r=50, t=80, b=50)
             )
             
             # Update axes
@@ -869,13 +881,16 @@ class VisualizationGenerator(BaseComponent):
                     paper_bgcolor=self.f1_colors['dark'],
                     font=dict(color='white', size=14),
                     height=600,
-                    width=1200,
+                    width=None,  # Let it be responsive
                     hovermode='closest',
                     legend=dict(
                         bgcolor=self.f1_colors['light'],
                         bordercolor=self.f1_colors['primary'],
                         borderwidth=1
-                    )
+                    ),
+                    # Make the chart responsive
+                    autosize=True,
+                    margin=dict(l=50, r=50, t=80, b=50)
                 )
                 figures.append(fig4)
                 figure_titles.append("Pit Stop Timing Analysis")
@@ -896,8 +911,9 @@ class VisualizationGenerator(BaseComponent):
                         padding: 20px;
                     }}
                     .container {{
-                        max-width: 1400px;
+                        max-width: 100%;
                         margin: 0 auto;
+                        padding: 0 20px;
                     }}
                     .chart-container {{
                         margin-bottom: 40px;
@@ -905,6 +921,12 @@ class VisualizationGenerator(BaseComponent):
                         border-radius: 10px;
                         padding: 20px;
                         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+                        width: 100%;
+                        overflow-x: auto;
+                    }}
+                    .chart-container .plotly-graph-div {{
+                        width: 100% !important;
+                        height: 100% !important;
                     }}
                     h1 {{
                         text-align: center;
@@ -917,6 +939,14 @@ class VisualizationGenerator(BaseComponent):
                         padding: 15px;
                         margin-bottom: 20px;
                         border-left: 4px solid #e10600;
+                    }}
+                    @media (max-width: 768px) {{
+                        .container {{
+                            padding: 0 10px;
+                        }}
+                        .chart-container {{
+                            padding: 10px;
+                        }}
                     }}
                 </style>
             </head>
@@ -1117,7 +1147,7 @@ class VisualizationGenerator(BaseComponent):
                 paper_bgcolor=self.f1_colors['dark'],
                 font=dict(color='white', size=12),
                 height=max(600, num_drivers * 40),  # Adjusted height calculation
-                width=1200,  # Slightly narrower for better fit
+                width=None,  # Let it be responsive
                 showlegend=True,
                 legend=dict(
                     bgcolor='rgba(0,0,0,0.8)',
@@ -1132,7 +1162,9 @@ class VisualizationGenerator(BaseComponent):
                 ),
                 margin=dict(l=180, r=180, t=60, b=60),  # Adjusted margins
                 bargap=0.15,  # Increased gap between bars
-                bargroupgap=0.1  # Increased gap between bar groups
+                bargroupgap=0.1,  # Increased gap between bar groups
+                # Make the chart responsive
+                autosize=True
             )
             
             # Update axes separately with better range fitting

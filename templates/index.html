@@ -396,6 +396,7 @@
       border-radius: 12px;
       overflow: hidden;
       border: 1px solid var(--gray-border);
+      max-width: 100%;
     }
 
     .visualization-header {
@@ -439,9 +440,33 @@
 
     .visualization-frame {
       width: 100%;
-      height: 400px;
+      height: 600px;
       border: none;
       background: var(--white);
+      min-height: 500px;
+    }
+    
+    /* Make visualizations responsive */
+    .visualization-container {
+      margin-top: 1rem;
+      background: var(--white);
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--gray-border);
+      max-width: 100%;
+    }
+    
+    .visualization-container iframe {
+      width: 100% !important;
+      height: 100% !important;
+      min-height: 500px;
+      border: none;
+    }
+    
+    /* Ensure Plotly charts are responsive */
+    .visualization-container .plotly-graph-div {
+      width: 100% !important;
+      height: 100% !important;
     }
 
     /* Mobile-first responsive design */
@@ -487,6 +512,16 @@
       
       .welcome-message h2 {
         font-size: 1.1rem;
+      }
+      
+      .visualization-frame {
+        height: 500px;
+        min-height: 400px;
+      }
+      
+      .visualization-container {
+        margin: 0.5rem 0;
+        border-radius: 8px;
       }
       
       .welcome-message p {
