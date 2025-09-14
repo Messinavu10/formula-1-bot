@@ -97,21 +97,23 @@
 6. **Response Generation**: Natural language + interactive visualizations
 7. **Session Update**: Conversation history and context maintained
 
-## 🎮 **Live Demo**
 
-### **Quick Start**
+### **Quick Start (Docker)**
+
 ```bash
-# Clone and setup
+# Clone the repository
 git clone <repository-url>
 cd formula-1-bot
+
+# Setup environment
 cp env.example .env
 # Edit .env with your OpenAI API key
 
-# One-command deployment
-./deploy.sh
+# Start with Docker Compose
+docker-compose up -d
 ```
-
 **Access the application:** http://localhost:8080
+
 
 ### **Sample Queries to Try**
 - *"Compare Max Verstappen and Lewis Hamilton at Monaco"*
@@ -163,29 +165,6 @@ formula-1-bot/
 ├── docker-compose.yml      # Production deployment
 └── deploy.sh              # One-command deployment script
 ```
-
-## 🚀 **Deployment Options**
-
-### **Local Development**
-```bash
-# Setup environment
-cp env.example .env
-# Add your OpenAI API key
-
-# Start services
-docker-compose up -d
-```
-
-### **Production Deployment**
-```bash
-# Full production setup with Nginx
-./deploy.sh
-```
-
-### **Cloud Deployment**
-- **Railway**: One-click deployment with automatic scaling
-- **AWS/GCP/Azure**: Container-based deployment with load balancing
-- **Docker Swarm**: Multi-node container orchestration
 
 ## 📈 **Key Technical Achievements**
 

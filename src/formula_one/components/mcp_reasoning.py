@@ -263,7 +263,9 @@ Intent:"""
             'spa': 'Belgian Grand Prix',
             'hungarian': 'Hungarian Grand Prix',
             'hungary': 'Hungarian Grand Prix',
-            'hungarian grand prix': 'Hungarian Grand Prix'
+            'hungarian grand prix': 'Hungarian Grand Prix',
+            'Dutch Grand Prix': 'Dutch Grand Prix',
+            'Dutch': 'Dutch Grand Prix'
         }
         
         query_lower = query.lower()
